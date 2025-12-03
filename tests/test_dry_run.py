@@ -1,3 +1,4 @@
+# tests/test_dry_run.py
 from __future__ import annotations
 
 import unittest
@@ -34,12 +35,23 @@ def _decision(*, eligible: bool) -> LLMDecision:
     return LLMDecision.model_validate(payload)
 
 
+_LONG_CAPTION = "x" * 60
+
+
 class _FakeScraper:
     def __init__(self, items: list[dict[str, Any]]) -> None:
         self._items = items
         self.calls: list[dict[str, Any]] = []
 
-    def run_and_fetch(self, terms: Any, *, apify: Any, timeout_secs: Any = None, dataset_limit: Any = None, clean: Any = True) -> Any:
+    def run_and_fetch(
+        self,
+        terms: Any,
+        *,
+        apify: Any,
+        timeout_secs: Any = None,
+        dataset_limit: Any = None,
+        clean: Any = True,
+    ) -> Any:
         self.calls.append(
             {
                 "terms": list(terms),
@@ -49,7 +61,11 @@ class _FakeScraper:
             }
         )
         return (
-            ActorRunRef(actor_id=apify.primary_actor, run_id="run_1", default_dataset_id="ds_1"),
+            ActorRunRef(
+                actor_id=apify.primary_actor,
+                run_id="run_1",
+                default_dataset_id="ds_1",
+            ),
             list(self._items),
         )
 
@@ -71,10 +87,10 @@ class TestDryRun(unittest.TestCase):
         secrets = RuntimeSecrets(apify_token="apify", openai_api_key="openai")
 
         items = [
-            {"url": "https://example.com/p/1", "caption": "a"},
-            {"url": "https://example.com/p/2", "caption": "b"},
-            {"url": "https://example.com/p/3", "caption": "c"},
-            {"url": "https://example.com/p/4", "caption": "d"},
+            {"url": "https://example.com/p/1", "caption": _LONG_CAPTION},
+            {"url": "https://example.com/p/2", "caption": _LONG_CAPTION},
+            {"url": "https://example.com/p/3", "caption": _LONG_CAPTION},
+            {"url": "https://example.com/p/4", "caption": _LONG_CAPTION},
         ]
 
         scraper = _FakeScraper(items)
@@ -85,7 +101,14 @@ class TestDryRun(unittest.TestCase):
         self.assertEqual(result.scraped_count, 4)
         self.assertEqual(result.processed_count, 3)
         self.assertEqual(result.eligible_count, 2)
-        self.assertEqual(classifier.calls, ["https://example.com/p/1", "https://example.com/p/2", "https://example.com/p/3"])
+        self.assertEqual(
+            classifier.calls,
+            [
+                "https://example.com/p/1",
+                "https://example.com/p/2",
+                "https://example.com/p/3",
+            ],
+        )
 
         self.assertEqual(len(scraper.calls), 1)
         self.assertEqual(scraper.calls[0]["results_limit_per_query"], 5)
@@ -96,10 +119,10 @@ class TestDryRun(unittest.TestCase):
         secrets = RuntimeSecrets(apify_token="apify", openai_api_key="openai")
 
         items = [
-            {"caption": "missing url"},
-            {"url": "https://example.com/p/1"},
-            {"url": "https://example.com/p/2"},
-            {"url": "https://example.com/p/3"},
+            {"caption": _LONG_CAPTION},
+            {"url": "https://example.com/p/1", "caption": _LONG_CAPTION},
+            {"url": "https://example.com/p/2", "caption": _LONG_CAPTION},
+            {"url": "https://example.com/p/3", "caption": _LONG_CAPTION},
         ]
 
         scraper = _FakeScraper(items)
@@ -109,7 +132,14 @@ class TestDryRun(unittest.TestCase):
 
         self.assertEqual(result.scraped_count, 4)
         self.assertEqual(result.processed_count, 3)
-        self.assertEqual(classifier.calls, ["https://example.com/p/1", "https://example.com/p/2", "https://example.com/p/3"])
+        self.assertEqual(
+            classifier.calls,
+            [
+                "https://example.com/p/1",
+                "https://example.com/p/2",
+                "https://example.com/p/3",
+            ],
+        )
 
 
 if __name__ == "__main__":

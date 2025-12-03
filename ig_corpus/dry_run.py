@@ -1,3 +1,4 @@
+# ig_corpus/dry_run.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,9 +7,11 @@ from typing import Any
 from .apify_client import InstagramHashtagScraper
 from .config import RuntimeSecrets
 from .config_schema import AppConfig
+from .dedupe import SeenKeys, dedupe_key
 from .llm import OpenAIPostClassifier
 from .llm_schema import LLMDecision
-from .normalize import post_for_llm_from_apify_item
+from .normalize import normalized_post_from_apify_item, post_for_llm
+from .prechecks import run_prechecks
 
 
 _DRY_RUN_RESULTS_LIMIT = 5
@@ -83,22 +86,32 @@ def run_dry_run(
         openai_cfg=config.openai,
     )
 
+    seen = SeenKeys()
     processed = 0
     eligible = 0
     example: dict[str, Any] | None = None
 
     for item in items:
-        post = post_for_llm_from_apify_item(item)
-        if post is None:
+        normalized = normalized_post_from_apify_item(item)
+        if normalized is None:
             continue
 
-        decision = post_classifier.classify(post)
+        key = dedupe_key(normalized)
+        if seen.has(key):
+            continue
+        seen.add(key)
+
+        checks = run_prechecks(normalized, filters=config.filters)
+        if not checks.passed:
+            continue
+
+        decision = post_classifier.classify(post_for_llm(normalized))
         processed += 1
         if decision.eligible:
             eligible += 1
 
         if example is None:
-            example = _redact_decision_for_print(post.url, decision)
+            example = _redact_decision_for_print(normalized.url, decision)
 
         if processed >= _DRY_RUN_LLM_ITEMS:
             break

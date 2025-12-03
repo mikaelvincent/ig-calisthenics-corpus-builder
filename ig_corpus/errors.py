@@ -7,3 +7,7 @@ class ConfigError(RuntimeError):
 
 class ApifyError(RuntimeError):
     """Raised when an Apify Actor run or dataset read fails."""
+
+
+class LLMError(RuntimeError):
+    """Raised when an OpenAI model call or structured parse fails."""

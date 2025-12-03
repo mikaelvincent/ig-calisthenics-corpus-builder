@@ -1,0 +1,52 @@
+targets:
+  final_n: 500
+  pool_n: 650
+  sampling_seed: 1337
+
+apify:
+  token_env: APIFY_TOKEN
+  primary_actor: apify/instagram-hashtag-scraper
+  fallback_actor: apify/instagram-scraper
+  results_type: posts
+  results_limit_per_query: 150
+  keyword_search: true
+  run_batch_queries: 4
+
+openai:
+  api_key_env: OPENAI_API_KEY
+  model_primary: gpt-5-nano
+  model_escalation: gpt-5-mini
+  escalation_confidence_threshold: 0.70
+  max_output_tokens: 650
+
+filters:
+  min_caption_chars: 40
+  max_posts_per_user: 10
+  allow_reels: true
+  reject_if_sponsored_true: false
+
+loop:
+  max_iterations: 200
+  stagnation_window: 10
+  stagnation_min_new_eligible: 15
+  max_raw_items: 20000
+  backoff_seconds: 10
+
+querying:
+  seed_terms:
+    - calisthenics
+    - streetworkout
+    - bodyweighttraining
+    - bodyweightworkout
+  expansion:
+    enabled: true
+    max_new_terms_per_iter: 15
+    min_hashtag_freq_in_eligible: 4
+    blocklist_terms:
+      - bodybuilding
+      - powerlifting
+      - crossfit
+      - yoga
+      - bouldering
+      - parkour
+      - calisthenicscompetition

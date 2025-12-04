@@ -4,6 +4,7 @@ import json
 import sys
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Iterable
@@ -245,6 +246,20 @@ def _apply_dominance_guard(
     return decision
 
 
+def _apply_pool_cap(decision: LLMDecision, *, eligible_total: int, pool_target: int) -> LLMDecision:
+    if not decision.eligible:
+        return decision
+    if eligible_total < pool_target:
+        return decision
+
+    return decision.model_copy(
+        update={
+            "eligible": False,
+            "eligibility_reasons": list(decision.eligibility_reasons) + ["pool_cap_reached"],
+        }
+    )
+
+
 def run_feedback_loop(
     config: AppConfig,
     secrets: RuntimeSecrets,
@@ -274,6 +289,7 @@ def run_feedback_loop(
             apify_primary_actor=config.apify.primary_actor,
             apify_fallback_actor=config.apify.fallback_actor,
             apify_keyword_search=bool(config.apify.keyword_search),
+            openai_max_concurrent_requests=int(config.openai.max_concurrent_requests),
             requested_run_id=(run_id or "").strip() or None,
             resume_requested=bool(resume),
         )
@@ -336,10 +352,22 @@ def run_feedback_loop(
 
     primary = scraper or InstagramHashtagScraper(secrets.apify_token)
     fallback = fallback_scraper or InstagramScraper(secrets.apify_token)
+
+    classifier_provided = classifier is not None
     post_classifier = classifier or OpenAIPostClassifier(
         secrets.openai_api_key,
         openai_cfg=config.openai,
     )
+
+    openai_concurrency = max(1, int(config.openai.max_concurrent_requests))
+    classifier_pool: list[OpenAIPostClassifier] | None = None
+    executor: ThreadPoolExecutor | None = None
+
+    if isinstance(post_classifier, OpenAIPostClassifier) and openai_concurrency > 1:
+        classifier_pool = [post_classifier]
+        for _ in range(openai_concurrency - 1):
+            classifier_pool.append(post_classifier.fork())
+        executor = ThreadPoolExecutor(max_workers=openai_concurrency, thread_name_prefix="openai")
 
     eligible_total = _eligible_count(store)
     raw_total = _raw_count(store)
@@ -360,6 +388,11 @@ def run_feedback_loop(
 
     current_results_limit = int(config.apify.results_limit_per_query)
     max_results_limit = 500
+
+    @dataclass(frozen=True)
+    class _LLMCandidate:
+        post_key: str
+        post: Any
 
     def _record_actor_run(run_ref: ActorRunRef) -> None:
         try:
@@ -388,120 +421,191 @@ def run_feedback_loop(
                 dataset_id=run_ref.default_dataset_id,
             )
 
+    def _classify_batch(candidates: list[_LLMCandidate]) -> list[tuple[LLMDecision, str, int | None]]:
+        if not candidates:
+            return []
+
+        if executor is None or classifier_pool is None:
+            out: list[tuple[LLMDecision, str, int | None]] = []
+            for cand in candidates:
+                try:
+                    decision, model_used, tokens_total = post_classifier.classify_with_metadata(
+                        post_for_llm(cand.post)
+                    )
+                except Exception as e:
+                    if logger is not None:
+                        logger.exception(
+                            "llm_classify_failed",
+                            exc=e,
+                            url=str(getattr(cand.post, "url", "") or ""),
+                            post_key=cand.post_key,
+                        )
+                    raise
+                out.append((decision, model_used, tokens_total))
+            return out
+
+        futures = []
+        for idx, cand in enumerate(candidates):
+            clf = classifier_pool[idx]
+            futures.append(executor.submit(clf.classify_with_metadata, post_for_llm(cand.post)))
+
+        out: list[tuple[LLMDecision, str, int | None]] = []
+        for cand, fut in zip(candidates, futures):
+            try:
+                decision, model_used, tokens_total = fut.result()
+            except Exception as e:
+                if logger is not None:
+                    logger.exception(
+                        "llm_classify_failed",
+                        exc=e,
+                        url=str(getattr(cand.post, "url", "") or ""),
+                        post_key=cand.post_key,
+                    )
+                raise
+            out.append((decision, model_used, tokens_total))
+        return out
+
     def _ingest_post_items(items: list[dict[str, Any]], *, actor_source: str) -> tuple[int, int]:
         nonlocal eligible_total, raw_total, decision_total
 
         new_eligible = 0
         processed = 0
 
-        for item in items:
-            post = normalized_post_from_apify_item(item)
-            if post is None:
-                continue
+        batch_target = len(classifier_pool) if classifier_pool is not None else 1
+        candidates: list[_LLMCandidate] = []
 
-            post_key = dedupe_key(post)
-            if post_key in seen_keys:
-                continue
+        def _flush_candidates() -> None:
+            nonlocal eligible_total, decision_total, processed, new_eligible
 
-            if raw_total >= config.loop.max_raw_items:
-                break
+            if not candidates:
+                return
 
-            try:
-                store.upsert_raw_post(
-                    post_key=post_key,
-                    url=post.url,
-                    actor_source=actor_source,
-                    raw_item=item,
+            results = _classify_batch(candidates)
+
+            for cand, (decision, model_used, tokens_total) in zip(candidates, results):
+                decision = enforce_structured_eligibility(decision)
+                decision = _apply_dominance_guard(
+                    decision,
+                    owner_username=getattr(cand.post, "owner_username", None),
+                    owner_id=getattr(cand.post, "owner_id", None),
+                    max_posts_per_user=int(config.filters.max_posts_per_user),
+                    user_counts=user_counts,
                 )
-            except Exception as e:
-                if logger is not None:
-                    logger.exception(
-                        "storage_upsert_raw_post_failed",
-                        exc=e,
-                        url=post.url,
-                        post_key=post_key,
-                        actor_source=actor_source,
-                    )
-                raise
-
-            seen_keys.add(post_key)
-            raw_total += 1
-
-            checks = run_prechecks(post, filters=config.filters)
-            if not checks.passed:
-                continue
-
-            try:
-                decision, model_used, tokens_total = post_classifier.classify_with_metadata(post_for_llm(post))
-            except Exception as e:
-                if logger is not None:
-                    logger.exception(
-                        "llm_classify_failed",
-                        exc=e,
-                        url=post.url,
-                        post_key=post_key,
-                    )
-                raise
-
-            decision = enforce_structured_eligibility(decision)
-            decision = _apply_dominance_guard(
-                decision,
-                owner_username=post.owner_username,
-                owner_id=post.owner_id,
-                max_posts_per_user=int(config.filters.max_posts_per_user),
-                user_counts=user_counts,
-            )
-
-            try:
-                store.record_llm_decision(
-                    post_key=post_key,
-                    url=post.url,
-                    model=model_used,
-                    decision=decision,
-                    tokens_total=tokens_total,
+                decision = _apply_pool_cap(
+                    decision,
+                    eligible_total=int(eligible_total),
+                    pool_target=int(config.targets.pool_n),
                 )
-            except Exception as e:
-                if logger is not None:
-                    logger.exception(
-                        "storage_record_llm_decision_failed",
-                        exc=e,
-                        url=post.url,
-                        post_key=post_key,
+
+                try:
+                    store.record_llm_decision(
+                        post_key=cand.post_key,
+                        url=str(getattr(cand.post, "url", "") or ""),
                         model=model_used,
+                        decision=decision,
+                        tokens_total=tokens_total,
                     )
-                raise
+                except Exception as e:
+                    if logger is not None:
+                        logger.exception(
+                            "storage_record_llm_decision_failed",
+                            exc=e,
+                            url=str(getattr(cand.post, "url", "") or ""),
+                            post_key=cand.post_key,
+                            model=model_used,
+                        )
+                    raise
 
-            decision_total += 1
-            processed += 1
+                decision_total += 1
+                processed += 1
 
-            if decision.eligible:
-                eligible_total += 1
-                new_eligible += 1
-                for tag in post.hashtags:
-                    hashtag_counts[tag] += 1
+                if decision.eligible:
+                    eligible_total += 1
+                    new_eligible += 1
+                    for tag in getattr(cand.post, "hashtags", ()) or ():
+                        hashtag_counts[tag] += 1
 
-            if eligible_total >= config.targets.pool_n:
-                break
+            candidates.clear()
+
+        try:
+            for item in items:
+                post = normalized_post_from_apify_item(item)
+                if post is None:
+                    continue
+
+                post_key = dedupe_key(post)
+                if post_key in seen_keys:
+                    continue
+
+                if raw_total >= config.loop.max_raw_items:
+                    break
+
+                try:
+                    store.upsert_raw_post(
+                        post_key=post_key,
+                        url=post.url,
+                        actor_source=actor_source,
+                        raw_item=item,
+                    )
+                except Exception as e:
+                    if logger is not None:
+                        logger.exception(
+                            "storage_upsert_raw_post_failed",
+                            exc=e,
+                            url=post.url,
+                            post_key=post_key,
+                            actor_source=actor_source,
+                        )
+                    raise
+
+                seen_keys.add(post_key)
+                raw_total += 1
+
+                checks = run_prechecks(post, filters=config.filters)
+                if not checks.passed:
+                    continue
+
+                candidates.append(_LLMCandidate(post_key=post_key, post=post))
+                if len(candidates) >= batch_target:
+                    _flush_candidates()
+                    if eligible_total >= config.targets.pool_n:
+                        break
+
+            _flush_candidates()
+        finally:
+            # Ensure we never leave candidates unrecorded if an exception escapes mid-batch.
+            candidates.clear()
 
         return processed, new_eligible
 
-    for iteration in range(int(config.loop.max_iterations)):
-        if eligible_total >= config.targets.pool_n:
-            pool_keys = fetch_eligible_pool_keys(store, limit=int(config.targets.pool_n))
-            ensure_final_sample(
-                store,
-                run_id=run_record.run_id,
-                pool_keys=pool_keys,
-                sampling_seed=int(config.targets.sampling_seed),
-                pool_n=int(config.targets.pool_n),
-                final_n=int(config.targets.final_n),
-                persist=len(pool_keys) >= int(config.targets.pool_n),
-            )
-            store.finish_run(run_record.run_id)
+    try:
+        for iteration in range(int(config.loop.max_iterations)):
+            if eligible_total >= config.targets.pool_n:
+                pool_keys = fetch_eligible_pool_keys(store, limit=int(config.targets.pool_n))
+                ensure_final_sample(
+                    store,
+                    run_id=run_record.run_id,
+                    pool_keys=pool_keys,
+                    sampling_seed=int(config.targets.sampling_seed),
+                    pool_n=int(config.targets.pool_n),
+                    final_n=int(config.targets.final_n),
+                    persist=len(pool_keys) >= int(config.targets.pool_n),
+                )
+                store.finish_run(run_record.run_id)
 
-            if logger is not None:
-                logger.info(
-                    "run_finished",
+                if logger is not None:
+                    logger.info(
+                        "run_finished",
+                        status="completed_pool",
+                        iterations=iteration,
+                        raw_posts=raw_total,
+                        decisions=decision_total,
+                        eligible=eligible_total,
+                        resumed=bool(resumed),
+                    )
+
+                return FeedbackLoopResult(
+                    run_id=run_record.run_id,
                     status="completed_pool",
                     iterations=iteration,
                     raw_posts=raw_total,
@@ -510,345 +614,353 @@ def run_feedback_loop(
                     resumed=bool(resumed),
                 )
 
-            return FeedbackLoopResult(
-                run_id=run_record.run_id,
-                status="completed_pool",
-                iterations=iteration,
-                raw_posts=raw_total,
-                decisions=decision_total,
-                eligible=eligible_total,
-                resumed=bool(resumed),
-            )
+            if raw_total >= config.loop.max_raw_items:
+                report = build_failure_report(
+                    status="max_raw_items",
+                    config=config,
+                    iterations=iteration,
+                    raw_posts=raw_total,
+                    decisions=decision_total,
+                    eligible=eligible_total,
+                )
 
-        if raw_total >= config.loop.max_raw_items:
-            report = build_failure_report(
-                status="max_raw_items",
-                config=config,
-                iterations=iteration,
-                raw_posts=raw_total,
-                decisions=decision_total,
-                eligible=eligible_total,
-            )
+                if logger is not None:
+                    logger.error("run_failure_report", status=report["status"], report=report)
 
-            if logger is not None:
-                logger.error("run_failure_report", status=report["status"], report=report)
+                store.finish_run(run_record.run_id)
 
-            store.finish_run(run_record.run_id)
+                if logger is not None:
+                    logger.info(
+                        "run_finished",
+                        status="max_raw_items",
+                        iterations=iteration,
+                        raw_posts=raw_total,
+                        decisions=decision_total,
+                        eligible=eligible_total,
+                        resumed=bool(resumed),
+                        failure_summary=str(report.get("summary") or ""),
+                    )
 
-            if logger is not None:
-                logger.info(
-                    "run_finished",
+                return FeedbackLoopResult(
+                    run_id=run_record.run_id,
                     status="max_raw_items",
                     iterations=iteration,
                     raw_posts=raw_total,
                     decisions=decision_total,
                     eligible=eligible_total,
                     resumed=bool(resumed),
-                    failure_summary=str(report.get("summary") or ""),
+                    failure_report=report,
                 )
 
-            return FeedbackLoopResult(
-                run_id=run_record.run_id,
-                status="max_raw_items",
-                iterations=iteration,
-                raw_posts=raw_total,
-                decisions=decision_total,
-                eligible=eligible_total,
-                resumed=bool(resumed),
-                failure_report=report,
-            )
-
-        batch = queue.pop_batch(int(config.apify.run_batch_queries))
-        if not batch:
-            queue.add_many(config.querying.seed_terms)
             batch = queue.pop_batch(int(config.apify.run_batch_queries))
+            if not batch:
+                queue.add_many(config.querying.seed_terms)
+                batch = queue.pop_batch(int(config.apify.run_batch_queries))
 
-        if not batch:
-            report = build_failure_report(
-                status="empty_query_queue",
-                config=config,
-                iterations=iteration,
-                raw_posts=raw_total,
-                decisions=decision_total,
-                eligible=eligible_total,
-            )
+            if not batch:
+                report = build_failure_report(
+                    status="empty_query_queue",
+                    config=config,
+                    iterations=iteration,
+                    raw_posts=raw_total,
+                    decisions=decision_total,
+                    eligible=eligible_total,
+                )
 
-            if logger is not None:
-                logger.error("run_failure_report", status=report["status"], report=report)
+                if logger is not None:
+                    logger.error("run_failure_report", status=report["status"], report=report)
 
-            store.finish_run(run_record.run_id)
+                store.finish_run(run_record.run_id)
 
-            if logger is not None:
-                logger.info(
-                    "run_finished",
+                if logger is not None:
+                    logger.info(
+                        "run_finished",
+                        status="empty_query_queue",
+                        iterations=iteration,
+                        raw_posts=raw_total,
+                        decisions=decision_total,
+                        eligible=eligible_total,
+                        resumed=bool(resumed),
+                        failure_summary=str(report.get("summary") or ""),
+                    )
+
+                return FeedbackLoopResult(
+                    run_id=run_record.run_id,
                     status="empty_query_queue",
                     iterations=iteration,
                     raw_posts=raw_total,
                     decisions=decision_total,
                     eligible=eligible_total,
                     resumed=bool(resumed),
-                    failure_summary=str(report.get("summary") or ""),
+                    failure_report=report,
                 )
 
-            return FeedbackLoopResult(
-                run_id=run_record.run_id,
-                status="empty_query_queue",
-                iterations=iteration,
-                raw_posts=raw_total,
-                decisions=decision_total,
-                eligible=eligible_total,
-                resumed=bool(resumed),
-                failure_report=report,
-            )
+            for b in batch:
+                attempted_keys.add(b.casefold())
 
-        for b in batch:
-            attempted_keys.add(b.casefold())
+            apify_cfg = config.apify.model_copy(update={"results_limit_per_query": int(current_results_limit)})
 
-        apify_cfg = config.apify.model_copy(update={"results_limit_per_query": int(current_results_limit)})
-
-        if logger is not None:
-            logger.info(
-                "apify_batch_started",
-                iteration=int(iteration),
-                terms=list(batch),
-                actor=apify_cfg.primary_actor,
-                results_limit=int(apify_cfg.results_limit_per_query),
-            )
-
-        try:
-            run_ref, items = primary.run_and_fetch(
-                batch,
-                apify=apify_cfg,
-                dataset_limit=None,
-                clean=True,
-            )
-        except Exception as e:
             if logger is not None:
-                logger.exception(
-                    "apify_batch_failed",
-                    exc=e,
+                logger.info(
+                    "apify_batch_started",
                     iteration=int(iteration),
                     terms=list(batch),
                     actor=apify_cfg.primary_actor,
-                )
-            raise
-
-        if logger is not None:
-            logger.info(
-                "apify_batch_fetched",
-                iteration=int(iteration),
-                actor_run_id=run_ref.run_id,
-                dataset_id=run_ref.default_dataset_id,
-                items_count=len(items),
-            )
-
-        _record_actor_run(run_ref)
-
-        processed_primary, new_eligible_primary = _ingest_post_items(items, actor_source=run_ref.actor_id)
-
-        if logger is not None:
-            logger.info(
-                "batch_ingested",
-                iteration=int(iteration),
-                actor_source=run_ref.actor_id,
-                processed=int(processed_primary),
-                new_eligible=int(new_eligible_primary),
-                eligible_total=int(eligible_total),
-                raw_total=int(raw_total),
-                decision_total=int(decision_total),
-            )
-
-        if config.querying.expansion.enabled:
-            new_terms = _selected_expansion_terms(
-                hashtag_counts,
-                min_freq=int(config.querying.expansion.min_hashtag_freq_in_eligible),
-                max_terms=int(config.querying.expansion.max_new_terms_per_iter),
-                blocklist_keys=blocklist_keys,
-                attempted_keys=attempted_keys,
-                present_keys=queue.present_keys(),
-            )
-            added = queue.add_many(new_terms)
-            if logger is not None and added > 0:
-                logger.info(
-                    "queue_expanded",
-                    iteration=int(iteration),
-                    added_terms=int(added),
+                    results_limit=int(apify_cfg.results_limit_per_query),
                 )
 
-        stagnated = stagnation.push(new_eligible_primary)
-
-        if stagnated and eligible_total < config.targets.pool_n:
-            current_results_limit = min(max_results_limit, max(10, current_results_limit * 2))
+            try:
+                run_ref, items = primary.run_and_fetch(
+                    batch,
+                    apify=apify_cfg,
+                    dataset_limit=None,
+                    clean=True,
+                )
+            except Exception as e:
+                if logger is not None:
+                    logger.exception(
+                        "apify_batch_failed",
+                        exc=e,
+                        iteration=int(iteration),
+                        terms=list(batch),
+                        actor=apify_cfg.primary_actor,
+                    )
+                raise
 
             if logger is not None:
-                logger.warning(
-                    "stagnation_triggered",
+                logger.info(
+                    "apify_batch_fetched",
                     iteration=int(iteration),
-                    window_size=int(config.loop.stagnation_window),
-                    window_total=int(stagnation.total()),
-                    new_results_limit=int(current_results_limit),
+                    actor_run_id=run_ref.run_id,
+                    dataset_id=run_ref.default_dataset_id,
+                    items_count=len(items),
                 )
 
-            search_seeds = _selected_expansion_terms(
-                hashtag_counts,
-                min_freq=1,
-                max_terms=3,
-                blocklist_keys=blocklist_keys,
-                attempted_keys=set(),
-                present_keys=set(),
-            )
-            if not search_seeds:
-                search_seeds = [t for t in config.querying.seed_terms if normalize_term(t)]
+            _record_actor_run(run_ref)
 
-            discovered_urls: list[str] = []
-            for seed in search_seeds[:3]:
-                if logger is not None:
+            processed_primary, new_eligible_primary = _ingest_post_items(items, actor_source=run_ref.actor_id)
+
+            if logger is not None:
+                logger.info(
+                    "batch_ingested",
+                    iteration=int(iteration),
+                    actor_source=run_ref.actor_id,
+                    processed=int(processed_primary),
+                    new_eligible=int(new_eligible_primary),
+                    eligible_total=int(eligible_total),
+                    raw_total=int(raw_total),
+                    decision_total=int(decision_total),
+                )
+
+            if config.querying.expansion.enabled:
+                new_terms = _selected_expansion_terms(
+                    hashtag_counts,
+                    min_freq=int(config.querying.expansion.min_hashtag_freq_in_eligible),
+                    max_terms=int(config.querying.expansion.max_new_terms_per_iter),
+                    blocklist_keys=blocklist_keys,
+                    attempted_keys=attempted_keys,
+                    present_keys=queue.present_keys(),
+                )
+                added = queue.add_many(new_terms)
+                if logger is not None and added > 0:
                     logger.info(
-                        "fallback_search_started",
+                        "queue_expanded",
                         iteration=int(iteration),
-                        query=str(seed),
-                        actor=apify_cfg.fallback_actor,
+                        added_terms=int(added),
                     )
 
-                try:
-                    search_run, search_items = fallback.search_hashtags_and_fetch(
-                        seed,
-                        apify=apify_cfg,
-                        search_limit=20,
-                        dataset_limit=50,
-                        clean=True,
+            stagnated = stagnation.push(new_eligible_primary)
+
+            if stagnated and eligible_total < config.targets.pool_n:
+                current_results_limit = min(max_results_limit, max(10, current_results_limit * 2))
+
+                if logger is not None:
+                    logger.warning(
+                        "stagnation_triggered",
+                        iteration=int(iteration),
+                        window_size=int(config.loop.stagnation_window),
+                        window_total=int(stagnation.total()),
+                        new_results_limit=int(current_results_limit),
                     )
-                except Exception as e:
+
+                search_seeds = _selected_expansion_terms(
+                    hashtag_counts,
+                    min_freq=1,
+                    max_terms=3,
+                    blocklist_keys=blocklist_keys,
+                    attempted_keys=set(),
+                    present_keys=set(),
+                )
+                if not search_seeds:
+                    search_seeds = [t for t in config.querying.seed_terms if normalize_term(t)]
+
+                discovered_urls: list[str] = []
+                for seed in search_seeds[:3]:
                     if logger is not None:
-                        logger.exception(
-                            "fallback_search_failed",
-                            exc=e,
+                        logger.info(
+                            "fallback_search_started",
                             iteration=int(iteration),
                             query=str(seed),
                             actor=apify_cfg.fallback_actor,
                         )
-                    raise
 
-                _record_actor_run(search_run)
+                    try:
+                        search_run, search_items = fallback.search_hashtags_and_fetch(
+                            seed,
+                            apify=apify_cfg,
+                            search_limit=20,
+                            dataset_limit=50,
+                            clean=True,
+                        )
+                    except Exception as e:
+                        if logger is not None:
+                            logger.exception(
+                                "fallback_search_failed",
+                                exc=e,
+                                iteration=int(iteration),
+                                query=str(seed),
+                                actor=apify_cfg.fallback_actor,
+                            )
+                        raise
 
-                urls = _extract_hashtag_search_urls(search_items)
-                discovered_urls.extend(urls)
+                    _record_actor_run(search_run)
 
-                if logger is not None:
-                    logger.info(
-                        "fallback_search_completed",
-                        iteration=int(iteration),
-                        query=str(seed),
-                        actor_run_id=search_run.run_id,
-                        dataset_id=search_run.default_dataset_id,
-                        discovered_urls=int(len(urls)),
-                    )
+                    urls = _extract_hashtag_search_urls(search_items)
+                    discovered_urls.extend(urls)
 
-            deduped_urls: list[str] = []
-            seen_url_keys: set[str] = set()
-            for u in discovered_urls:
-                k = (u or "").strip().casefold()
-                if not k or k in seen_url_keys:
-                    continue
-                seen_url_keys.add(k)
-                deduped_urls.append(u)
-
-            discovered_terms: list[str] = []
-            for u in deduped_urls:
-                tag = _extract_hashtag_from_url(u)
-                if tag:
-                    key = tag.casefold()
-                    if key not in blocklist_keys and key not in attempted_keys:
-                        discovered_terms.append(tag)
-
-            added = queue.add_many(discovered_terms)
-            if logger is not None and added > 0:
-                logger.info(
-                    "fallback_terms_queued",
-                    iteration=int(iteration),
-                    added_terms=int(added),
-                )
-
-            scrape_urls = [u for u in deduped_urls if _extract_hashtag_from_url(u)]
-            scrape_urls = scrape_urls[:10]
-            if scrape_urls:
-                if logger is not None:
-                    logger.info(
-                        "fallback_scrape_started",
-                        iteration=int(iteration),
-                        actor=apify_cfg.fallback_actor,
-                        urls_count=int(len(scrape_urls)),
-                    )
-
-                try:
-                    scrape_run, scrape_items = fallback.scrape_urls_and_fetch(
-                        scrape_urls,
-                        apify=apify_cfg,
-                        results_limit=min(50, int(current_results_limit)),
-                        dataset_limit=None,
-                        clean=True,
-                    )
-                except Exception as e:
                     if logger is not None:
-                        logger.exception(
-                            "fallback_scrape_failed",
-                            exc=e,
+                        logger.info(
+                            "fallback_search_completed",
+                            iteration=int(iteration),
+                            query=str(seed),
+                            actor_run_id=search_run.run_id,
+                            dataset_id=search_run.default_dataset_id,
+                            discovered_urls=int(len(urls)),
+                        )
+
+                deduped_urls: list[str] = []
+                seen_url_keys: set[str] = set()
+                for u in discovered_urls:
+                    k = (u or "").strip().casefold()
+                    if not k or k in seen_url_keys:
+                        continue
+                    seen_url_keys.add(k)
+                    deduped_urls.append(u)
+
+                discovered_terms: list[str] = []
+                for u in deduped_urls:
+                    tag = _extract_hashtag_from_url(u)
+                    if tag:
+                        key = tag.casefold()
+                        if key not in blocklist_keys and key not in attempted_keys:
+                            discovered_terms.append(tag)
+
+                added = queue.add_many(discovered_terms)
+                if logger is not None and added > 0:
+                    logger.info(
+                        "fallback_terms_queued",
+                        iteration=int(iteration),
+                        added_terms=int(added),
+                    )
+
+                scrape_urls = [u for u in deduped_urls if _extract_hashtag_from_url(u)]
+                scrape_urls = scrape_urls[:10]
+                if scrape_urls:
+                    if logger is not None:
+                        logger.info(
+                            "fallback_scrape_started",
                             iteration=int(iteration),
                             actor=apify_cfg.fallback_actor,
+                            urls_count=int(len(scrape_urls)),
                         )
-                    raise
 
-                _record_actor_run(scrape_run)
-                processed_fb, new_eligible_fb = _ingest_post_items(scrape_items, actor_source=scrape_run.actor_id)
+                    try:
+                        scrape_run, scrape_items = fallback.scrape_urls_and_fetch(
+                            scrape_urls,
+                            apify=apify_cfg,
+                            results_limit=min(50, int(current_results_limit)),
+                            dataset_limit=None,
+                            clean=True,
+                        )
+                    except Exception as e:
+                        if logger is not None:
+                            logger.exception(
+                                "fallback_scrape_failed",
+                                exc=e,
+                                iteration=int(iteration),
+                                actor=apify_cfg.fallback_actor,
+                            )
+                        raise
 
-                if logger is not None:
-                    logger.info(
-                        "fallback_scrape_completed",
-                        iteration=int(iteration),
-                        actor_run_id=scrape_run.run_id,
-                        dataset_id=scrape_run.default_dataset_id,
-                        items_count=int(len(scrape_items)),
-                        processed=int(processed_fb),
-                        new_eligible=int(new_eligible_fb),
+                    _record_actor_run(scrape_run)
+                    processed_fb, new_eligible_fb = _ingest_post_items(
+                        scrape_items, actor_source=scrape_run.actor_id
                     )
 
-        if config.loop.backoff_seconds > 0:
-            time.sleep(float(config.loop.backoff_seconds))
+                    if logger is not None:
+                        logger.info(
+                            "fallback_scrape_completed",
+                            iteration=int(iteration),
+                            actor_run_id=scrape_run.run_id,
+                            dataset_id=scrape_run.default_dataset_id,
+                            items_count=int(len(scrape_items)),
+                            processed=int(processed_fb),
+                            new_eligible=int(new_eligible_fb),
+                        )
 
-    report = build_failure_report(
-        status="max_iterations",
-        config=config,
-        iterations=int(config.loop.max_iterations),
-        raw_posts=raw_total,
-        decisions=decision_total,
-        eligible=eligible_total,
-        recent_new_eligible_total=int(stagnation.total()),
-    )
+            if config.loop.backoff_seconds > 0:
+                time.sleep(float(config.loop.backoff_seconds))
 
-    if logger is not None:
-        logger.error("run_failure_report", status=report["status"], report=report)
+        report = build_failure_report(
+            status="max_iterations",
+            config=config,
+            iterations=int(config.loop.max_iterations),
+            raw_posts=raw_total,
+            decisions=decision_total,
+            eligible=eligible_total,
+            recent_new_eligible_total=int(stagnation.total()),
+        )
 
-    store.finish_run(run_record.run_id)
+        if logger is not None:
+            logger.error("run_failure_report", status=report["status"], report=report)
 
-    if logger is not None:
-        logger.info(
-            "run_finished",
+        store.finish_run(run_record.run_id)
+
+        if logger is not None:
+            logger.info(
+                "run_finished",
+                status="max_iterations",
+                iterations=int(config.loop.max_iterations),
+                raw_posts=raw_total,
+                decisions=decision_total,
+                eligible=eligible_total,
+                resumed=bool(resumed),
+                failure_summary=str(report.get("summary") or ""),
+            )
+
+        return FeedbackLoopResult(
+            run_id=run_record.run_id,
             status="max_iterations",
             iterations=int(config.loop.max_iterations),
             raw_posts=raw_total,
             decisions=decision_total,
             eligible=eligible_total,
             resumed=bool(resumed),
-            failure_summary=str(report.get("summary") or ""),
+            failure_report=report,
         )
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
 
-    return FeedbackLoopResult(
-        run_id=run_record.run_id,
-        status="max_iterations",
-        iterations=int(config.loop.max_iterations),
-        raw_posts=raw_total,
-        decisions=decision_total,
-        eligible=eligible_total,
-        resumed=bool(resumed),
-        failure_report=report,
-    )
+        if classifier_pool is not None:
+            for c in classifier_pool[1:]:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+
+        if not classifier_provided:
+            try:
+                post_classifier.close()
+            except Exception:
+                pass

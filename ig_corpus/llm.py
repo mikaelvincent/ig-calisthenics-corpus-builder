@@ -9,6 +9,8 @@ from openai import OpenAI
 from .config_schema import OpenAIConfig
 from .errors import LLMError
 from .llm_schema import DECISION_JSON_SCHEMA, DECISION_SCHEMA_NAME, LLMDecision
+from .openai_retry import is_retryable_openai_exception
+from .retry import OnRetryFn, RetryConfig, SleepFn, call_with_retries
 
 
 class _ResponsesAPI(Protocol):
@@ -50,6 +52,15 @@ _TEXT_FORMAT: dict[str, Any] = {
         "schema": DECISION_JSON_SCHEMA,
     }
 }
+
+_DEFAULT_OPENAI_RETRY = RetryConfig(
+    # 1 try + 5 retries
+    max_attempts=6,
+    base_delay_seconds=0.5,
+    max_delay_seconds=20.0,
+    jitter_ratio=0.25,
+    retry_after_cap_seconds=60.0,
+)
 
 
 @dataclass(frozen=True)
@@ -134,13 +145,24 @@ class OpenAIPostClassifier:
         *,
         openai_cfg: OpenAIConfig,
         client: _OpenAIClient | None = None,
+        retry: RetryConfig | None = None,
+        on_retry: OnRetryFn | None = None,
+        sleep_fn: SleepFn | None = None,
     ) -> None:
         key = (api_key or "").strip()
         if not key:
             raise ValueError("api_key must be a non-empty string")
 
         self._cfg = openai_cfg
-        self._client: _OpenAIClient = client or OpenAI(api_key=key)
+        self._retry = retry or _DEFAULT_OPENAI_RETRY
+        self._on_retry = on_retry
+        self._sleep_fn = sleep_fn
+
+        # Disable SDK-level retries because we implement retries with jitter here.
+        if client is not None:
+            self._client = client
+        else:
+            self._client = OpenAI(api_key=key, max_retries=0)
 
     def _escalation_model(self) -> str | None:
         primary = (self._cfg.model_primary or "").strip()
@@ -150,8 +172,8 @@ class OpenAIPostClassifier:
         return escalation
 
     def _call_raw(self, *, model: str, post: PostForLLM) -> tuple[str, int | None]:
-        try:
-            response = self._client.responses.create(
+        def _do_call() -> Any:
+            return self._client.responses.create(
                 model=model,
                 instructions=_SYSTEM_INSTRUCTIONS,
                 input=[
@@ -159,6 +181,17 @@ class OpenAIPostClassifier:
                 ],
                 text=_TEXT_FORMAT,
                 max_output_tokens=self._cfg.max_output_tokens,
+            )
+
+        try:
+            response = call_with_retries(
+                _do_call,
+                cfg=self._retry,
+                is_retryable=is_retryable_openai_exception,
+                operation=f"openai.responses.create:{model}",
+                on_retry=self._on_retry,
+                sleep_fn=self._sleep_fn,
+                context_url=post.url,
             )
         except Exception as e:
             raise LLMError(f"OpenAI call failed ({model}): {e}") from e
@@ -188,14 +221,22 @@ class OpenAIPostClassifier:
             if escalation_model is None:
                 raise
             raw_escalation, tok_escalation = self._call_raw(model=escalation_model, post=post)
-            return self._parse_decision(raw_escalation, model=escalation_model), escalation_model, tok_escalation
+            return (
+                self._parse_decision(raw_escalation, model=escalation_model),
+                escalation_model,
+                tok_escalation,
+            )
 
         if (
             escalation_model is not None
             and decision_primary.overall_confidence < self._cfg.escalation_confidence_threshold
         ):
             raw_escalation, tok_escalation = self._call_raw(model=escalation_model, post=post)
-            return self._parse_decision(raw_escalation, model=escalation_model), escalation_model, tok_escalation
+            return (
+                self._parse_decision(raw_escalation, model=escalation_model),
+                escalation_model,
+                tok_escalation,
+            )
 
         return decision_primary, primary_model, tok_primary
 

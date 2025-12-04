@@ -6,8 +6,20 @@ from typing import Any, Iterator, Sequence
 from apify_client import ApifyClient
 from apify_client.errors import ApifyApiError
 
+from .apify_retry import is_retryable_apify_exception
 from .config_schema import ApifyConfig
 from .errors import ApifyError
+from .retry import OnRetryFn, RetryConfig, SleepFn, call_with_retries
+
+
+_DEFAULT_APIFY_RETRY = RetryConfig(
+    # Mirrors the Apify client's documented default behavior: ~8 retries after the first attempt.
+    max_attempts=9,
+    base_delay_seconds=0.5,
+    max_delay_seconds=20.0,
+    jitter_ratio=0.0,
+    retry_after_cap_seconds=0.0,
+)
 
 
 @dataclass(frozen=True)
@@ -74,8 +86,27 @@ class InstagramHashtagScraper:
     This module is deliberately low-level: it only runs the Actor and retrieves dataset items.
     """
 
-    def __init__(self, token: str, *, client: ApifyClient | None = None) -> None:
-        self._client = client or ApifyClient(token=token)
+    def __init__(
+        self,
+        token: str,
+        *,
+        client: ApifyClient | None = None,
+        retry: RetryConfig | None = None,
+        on_retry: OnRetryFn | None = None,
+        sleep_fn: SleepFn | None = None,
+    ) -> None:
+        self._retry = retry or _DEFAULT_APIFY_RETRY
+        self._on_retry = on_retry
+        self._sleep_fn = sleep_fn
+
+        if client is not None:
+            self._client = client
+        else:
+            # Disable client-level retries so we can apply our own policy uniformly.
+            try:
+                self._client = ApifyClient(token=token, max_retries=0)
+            except TypeError:
+                self._client = ApifyClient(token=token)
 
     def run_once(
         self,
@@ -100,15 +131,23 @@ class InstagramHashtagScraper:
             "keywordSearch": apify.keyword_search,
         }
 
-        try:
-            result = self._client.actor(apify.primary_actor).call(
+        def _do_call() -> Any:
+            return self._client.actor(apify.primary_actor).call(
                 run_input=run_input,
                 timeout_secs=timeout_secs,
             )
+
+        try:
+            result = call_with_retries(
+                _do_call,
+                cfg=self._retry,
+                is_retryable=is_retryable_apify_exception,
+                operation=f"apify.actor.call:{apify.primary_actor}",
+                on_retry=self._on_retry,
+                sleep_fn=self._sleep_fn,
+            )
         except ApifyApiError as e:
-            raise ApifyError(
-                f"Apify Actor call failed ({apify.primary_actor}): {e}"
-            ) from e
+            raise ApifyError(f"Apify Actor call failed ({apify.primary_actor}): {e}") from e
         except Exception as e:
             raise ApifyError(
                 f"Unexpected error while calling Apify Actor ({apify.primary_actor}): {e}"
@@ -138,20 +177,11 @@ class InstagramHashtagScraper:
         clean: bool = True,
     ) -> Iterator[dict[str, Any]]:
         """
-        Stream items from a dataset produced by an Actor run.
+        Iterate items from a dataset produced by an Actor run.
 
-        Use clean=True to skip hidden/empty fields, which keeps downstream normalization simpler.
+        For retryability, this fetches the full list and then yields items.
         """
-        ds = (dataset_id or "").strip()
-        if not ds:
-            raise ApifyError("dataset_id must be a non-empty string")
-
-        try:
-            yield from self._client.dataset(ds).iterate_items(limit=limit, clean=clean)
-        except ApifyApiError as e:
-            raise ApifyError(f"Failed to read dataset items ({ds}): {e}") from e
-        except Exception as e:
-            raise ApifyError(f"Unexpected error while reading dataset ({ds}): {e}") from e
+        yield from self.fetch_dataset_items(dataset_id, limit=limit, clean=clean)
 
     def fetch_dataset_items(
         self,
@@ -160,7 +190,26 @@ class InstagramHashtagScraper:
         limit: int | None = None,
         clean: bool = True,
     ) -> list[dict[str, Any]]:
-        return list(self.iter_dataset_items(dataset_id, limit=limit, clean=clean))
+        ds = (dataset_id or "").strip()
+        if not ds:
+            raise ApifyError("dataset_id must be a non-empty string")
+
+        def _do_fetch() -> list[dict[str, Any]]:
+            return list(self._client.dataset(ds).iterate_items(limit=limit, clean=clean))
+
+        try:
+            return call_with_retries(
+                _do_fetch,
+                cfg=self._retry,
+                is_retryable=is_retryable_apify_exception,
+                operation=f"apify.dataset.iterate_items:{ds}",
+                on_retry=self._on_retry,
+                sleep_fn=self._sleep_fn,
+            )
+        except ApifyApiError as e:
+            raise ApifyError(f"Failed to read dataset items ({ds}): {e}") from e
+        except Exception as e:
+            raise ApifyError(f"Unexpected error while reading dataset ({ds}): {e}") from e
 
     def run_and_fetch(
         self,
@@ -220,8 +269,27 @@ class InstagramScraper:
     - scraping posts from known Instagram URLs (`directUrls`)
     """
 
-    def __init__(self, token: str, *, client: ApifyClient | None = None) -> None:
-        self._client = client or ApifyClient(token=token)
+    def __init__(
+        self,
+        token: str,
+        *,
+        client: ApifyClient | None = None,
+        retry: RetryConfig | None = None,
+        on_retry: OnRetryFn | None = None,
+        sleep_fn: SleepFn | None = None,
+    ) -> None:
+        self._retry = retry or _DEFAULT_APIFY_RETRY
+        self._on_retry = on_retry
+        self._sleep_fn = sleep_fn
+
+        if client is not None:
+            self._client = client
+        else:
+            # Disable client-level retries so we can apply our own policy uniformly.
+            try:
+                self._client = ApifyClient(token=token, max_retries=0)
+            except TypeError:
+                self._client = ApifyClient(token=token)
 
     def run_search_hashtags(
         self,
@@ -243,15 +311,23 @@ class InstagramScraper:
             "searchLimit": int(search_limit),
         }
 
-        try:
-            result = self._client.actor(apify.fallback_actor).call(
+        def _do_call() -> Any:
+            return self._client.actor(apify.fallback_actor).call(
                 run_input=run_input,
                 timeout_secs=timeout_secs,
             )
+
+        try:
+            result = call_with_retries(
+                _do_call,
+                cfg=self._retry,
+                is_retryable=is_retryable_apify_exception,
+                operation=f"apify.actor.call:{apify.fallback_actor}:search",
+                on_retry=self._on_retry,
+                sleep_fn=self._sleep_fn,
+            )
         except ApifyApiError as e:
-            raise ApifyError(
-                f"Apify Actor call failed ({apify.fallback_actor}): {e}"
-            ) from e
+            raise ApifyError(f"Apify Actor call failed ({apify.fallback_actor}): {e}") from e
         except Exception as e:
             raise ApifyError(
                 f"Unexpected error while calling Apify Actor ({apify.fallback_actor}): {e}"
@@ -291,15 +367,23 @@ class InstagramScraper:
             "resultsLimit": int(results_limit),
         }
 
-        try:
-            result = self._client.actor(apify.fallback_actor).call(
+        def _do_call() -> Any:
+            return self._client.actor(apify.fallback_actor).call(
                 run_input=run_input,
                 timeout_secs=timeout_secs,
             )
+
+        try:
+            result = call_with_retries(
+                _do_call,
+                cfg=self._retry,
+                is_retryable=is_retryable_apify_exception,
+                operation=f"apify.actor.call:{apify.fallback_actor}:directUrls",
+                on_retry=self._on_retry,
+                sleep_fn=self._sleep_fn,
+            )
         except ApifyApiError as e:
-            raise ApifyError(
-                f"Apify Actor call failed ({apify.fallback_actor}): {e}"
-            ) from e
+            raise ApifyError(f"Apify Actor call failed ({apify.fallback_actor}): {e}") from e
         except Exception as e:
             raise ApifyError(
                 f"Unexpected error while calling Apify Actor ({apify.fallback_actor}): {e}"
@@ -328,16 +412,7 @@ class InstagramScraper:
         limit: int | None = None,
         clean: bool = True,
     ) -> Iterator[dict[str, Any]]:
-        ds = (dataset_id or "").strip()
-        if not ds:
-            raise ApifyError("dataset_id must be a non-empty string")
-
-        try:
-            yield from self._client.dataset(ds).iterate_items(limit=limit, clean=clean)
-        except ApifyApiError as e:
-            raise ApifyError(f"Failed to read dataset items ({ds}): {e}") from e
-        except Exception as e:
-            raise ApifyError(f"Unexpected error while reading dataset ({ds}): {e}") from e
+        yield from self.fetch_dataset_items(dataset_id, limit=limit, clean=clean)
 
     def fetch_dataset_items(
         self,
@@ -346,7 +421,26 @@ class InstagramScraper:
         limit: int | None = None,
         clean: bool = True,
     ) -> list[dict[str, Any]]:
-        return list(self.iter_dataset_items(dataset_id, limit=limit, clean=clean))
+        ds = (dataset_id or "").strip()
+        if not ds:
+            raise ApifyError("dataset_id must be a non-empty string")
+
+        def _do_fetch() -> list[dict[str, Any]]:
+            return list(self._client.dataset(ds).iterate_items(limit=limit, clean=clean))
+
+        try:
+            return call_with_retries(
+                _do_fetch,
+                cfg=self._retry,
+                is_retryable=is_retryable_apify_exception,
+                operation=f"apify.dataset.iterate_items:{ds}",
+                on_retry=self._on_retry,
+                sleep_fn=self._sleep_fn,
+            )
+        except ApifyApiError as e:
+            raise ApifyError(f"Failed to read dataset items ({ds}): {e}") from e
+        except Exception as e:
+            raise ApifyError(f"Unexpected error while reading dataset ({ds}): {e}") from e
 
     def search_hashtags_and_fetch(
         self,

@@ -12,6 +12,7 @@ from .errors import ApifyError, ConfigError, ExportError, LLMError, StorageError
 from .export_excel import export_corpus_workbook
 from .export_pdf import export_codebook_pdf
 from .loop import run_feedback_loop
+from .run_log import RunLogger
 from .storage import SQLiteStateStore
 
 
@@ -86,31 +87,67 @@ def _cmd_dry_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    cfg = load_config(args.config)
-    secrets = resolve_runtime_secrets(cfg)
-
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    db_path = out_dir / "state.sqlite"
-    xlsx_path = out_dir / "corpus.xlsx"
-    pdf_path = out_dir / "codebook.pdf"
+    log_path = out_dir / "run.log"
+    with RunLogger.open(log_path, overwrite=True) as log:
+        log.info(
+            "run_command_started",
+            config_path=str(args.config),
+            out_dir=str(out_dir),
+        )
 
-    with SQLiteStateStore.open(db_path) as store:
-        result = run_feedback_loop(cfg, secrets, store=store)
-        export_corpus_workbook(cfg, store, xlsx_path, run_id=result.run_id)
-        export_codebook_pdf(cfg, store, pdf_path, run_id=result.run_id)
+        try:
+            cfg = load_config(args.config)
+            secrets = resolve_runtime_secrets(cfg)
 
-    print(f"status={result.status}")
-    print(f"run_id={result.run_id}")
-    print(f"iterations={result.iterations}")
-    print(f"raw_posts={result.raw_posts}")
-    print(f"decisions={result.decisions}")
-    print(f"eligible={result.eligible}")
-    print(f"corpus_xlsx={xlsx_path}")
-    print(f"codebook_pdf={pdf_path}")
+            log.info(
+                "config_loaded",
+                config_path=str(args.config),
+                apify_token_env=cfg.apify.token_env,
+                openai_api_key_env=cfg.openai.api_key_env,
+            )
 
-    return 0 if result.status == "completed_pool" else 4
+            db_path = out_dir / "state.sqlite"
+            xlsx_path = out_dir / "corpus.xlsx"
+            pdf_path = out_dir / "codebook.pdf"
+
+            with SQLiteStateStore.open(db_path) as store:
+                result = run_feedback_loop(cfg, secrets, store=store, logger=log)
+
+                log.info(
+                    "feedback_loop_completed",
+                    status=result.status,
+                    run_id=result.run_id,
+                    iterations=result.iterations,
+                    raw_posts=result.raw_posts,
+                    decisions=result.decisions,
+                    eligible=result.eligible,
+                )
+
+                log.info("export_excel_started", path=str(xlsx_path))
+                export_corpus_workbook(cfg, store, xlsx_path, run_id=result.run_id)
+                log.info("export_excel_completed", path=str(xlsx_path))
+
+                log.info("export_pdf_started", path=str(pdf_path))
+                export_codebook_pdf(cfg, store, pdf_path, run_id=result.run_id)
+                log.info("export_pdf_completed", path=str(pdf_path))
+
+            print(f"status={result.status}")
+            print(f"run_id={result.run_id}")
+            print(f"iterations={result.iterations}")
+            print(f"raw_posts={result.raw_posts}")
+            print(f"decisions={result.decisions}")
+            print(f"eligible={result.eligible}")
+            print(f"corpus_xlsx={xlsx_path}")
+            print(f"codebook_pdf={pdf_path}")
+            print(f"run_log={log_path}")
+
+            return 0 if result.status == "completed_pool" else 4
+        except Exception as e:
+            log.exception("run_command_failed", exc=e)
+            raise
 
 
 def main(argv: Sequence[str] | None = None) -> int:

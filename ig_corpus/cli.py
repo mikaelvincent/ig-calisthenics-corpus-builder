@@ -3,11 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import Sequence
 
 from .config import load_config, resolve_runtime_secrets
 from .dry_run import run_dry_run
-from .errors import ApifyError, ConfigError, LLMError
+from .errors import ApifyError, ConfigError, LLMError, StorageError
+from .loop import run_feedback_loop
+from .storage import SQLiteStateStore
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -28,7 +31,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser(
         "run",
-        help="Run the full corpus build loop (not implemented yet).",
+        help="Run the corpus build feedback loop until the pool target is met.",
     )
     run.add_argument(
         "--config",
@@ -38,7 +41,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--out",
         required=True,
-        help="Output directory for exports.",
+        help="Output directory for state and logs.",
     )
     run.set_defaults(_handler=_cmd_run)
 
@@ -66,8 +69,24 @@ def _cmd_dry_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    _eprint("The 'run' command is not implemented yet.")
-    return 2
+    cfg = load_config(args.config)
+    secrets = resolve_runtime_secrets(cfg)
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    db_path = out_dir / "state.sqlite"
+    with SQLiteStateStore.open(db_path) as store:
+        result = run_feedback_loop(cfg, secrets, store=store)
+
+    print(f"status={result.status}")
+    print(f"run_id={result.run_id}")
+    print(f"iterations={result.iterations}")
+    print(f"raw_posts={result.raw_posts}")
+    print(f"decisions={result.decisions}")
+    print(f"eligible={result.eligible}")
+
+    return 0 if result.status == "completed_pool" else 4
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -80,7 +99,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ConfigError as e:
         _eprint(str(e))
         return 2
-    except (ApifyError, LLMError) as e:
+    except (ApifyError, LLMError, StorageError) as e:
         _eprint(str(e))
         return 3
     except KeyboardInterrupt:

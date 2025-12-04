@@ -15,3 +15,7 @@ class LLMError(RuntimeError):
 
 class StorageError(RuntimeError):
     """Raised when reading or writing state in SQLite fails."""
+
+
+class ExportError(RuntimeError):
+    """Raised when generating exported artifacts fails."""

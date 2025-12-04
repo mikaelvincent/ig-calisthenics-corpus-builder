@@ -99,10 +99,10 @@ class _FakeClassifier:
         self._eligibles = list(eligibles)
         self.calls: list[str] = []
 
-    def classify_with_metadata(self, post: PostForLLM) -> tuple[LLMDecision, str]:
+    def classify_with_metadata(self, post: PostForLLM) -> tuple[LLMDecision, str, int | None]:
         self.calls.append(post.url)
         eligible = self._eligibles.pop(0) if self._eligibles else False
-        return _decision(eligible=eligible), "gpt-5-nano"
+        return _decision(eligible=eligible), "gpt-5-nano", None
 
 
 class TestFeedbackLoop(unittest.TestCase):

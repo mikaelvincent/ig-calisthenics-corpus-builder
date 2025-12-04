@@ -96,6 +96,30 @@ def _extract_output_text(response: Any) -> str:
     raise LLMError("OpenAI response did not include output text")
 
 
+def _extract_total_tokens(response: Any) -> int | None:
+    usage = getattr(response, "usage", None)
+    if usage is None and isinstance(response, dict):
+        usage = response.get("usage")
+
+    if usage is None:
+        return None
+
+    val: Any
+    if isinstance(usage, dict):
+        val = usage.get("total_tokens")
+    else:
+        val = getattr(usage, "total_tokens", None)
+
+    if val is None:
+        return None
+
+    try:
+        n = int(val)
+        return n if n >= 0 else None
+    except Exception:
+        return None
+
+
 class OpenAIPostClassifier:
     """
     Minimal OpenAI wrapper for one-post-per-call labeling with Structured Outputs.
@@ -125,7 +149,7 @@ class OpenAIPostClassifier:
             return None
         return escalation
 
-    def _call_raw(self, *, model: str, post: PostForLLM) -> str:
+    def _call_raw(self, *, model: str, post: PostForLLM) -> tuple[str, int | None]:
         try:
             response = self._client.responses.create(
                 model=model,
@@ -139,7 +163,7 @@ class OpenAIPostClassifier:
         except Exception as e:
             raise LLMError(f"OpenAI call failed ({model}): {e}") from e
 
-        return _extract_output_text(response)
+        return _extract_output_text(response), _extract_total_tokens(response)
 
     def _parse_decision(self, raw: str, *, model: str) -> LLMDecision:
         try:
@@ -147,7 +171,7 @@ class OpenAIPostClassifier:
         except Exception as e:
             raise LLMError(f"Failed to parse structured output ({model}): {e}") from e
 
-    def _classify_internal(self, post: PostForLLM) -> tuple[LLMDecision, str]:
+    def _classify_internal(self, post: PostForLLM) -> tuple[LLMDecision, str, int | None]:
         if not (post.url or "").strip():
             raise ValueError("post.url must be non-empty")
 
@@ -157,27 +181,27 @@ class OpenAIPostClassifier:
 
         escalation_model = self._escalation_model()
 
-        raw_primary = self._call_raw(model=primary_model, post=post)
+        raw_primary, tok_primary = self._call_raw(model=primary_model, post=post)
         try:
             decision_primary = self._parse_decision(raw_primary, model=primary_model)
         except LLMError:
             if escalation_model is None:
                 raise
-            raw_escalation = self._call_raw(model=escalation_model, post=post)
-            return self._parse_decision(raw_escalation, model=escalation_model), escalation_model
+            raw_escalation, tok_escalation = self._call_raw(model=escalation_model, post=post)
+            return self._parse_decision(raw_escalation, model=escalation_model), escalation_model, tok_escalation
 
         if (
             escalation_model is not None
             and decision_primary.overall_confidence < self._cfg.escalation_confidence_threshold
         ):
-            raw_escalation = self._call_raw(model=escalation_model, post=post)
-            return self._parse_decision(raw_escalation, model=escalation_model), escalation_model
+            raw_escalation, tok_escalation = self._call_raw(model=escalation_model, post=post)
+            return self._parse_decision(raw_escalation, model=escalation_model), escalation_model, tok_escalation
 
-        return decision_primary, primary_model
+        return decision_primary, primary_model, tok_primary
 
     def classify(self, post: PostForLLM) -> LLMDecision:
-        decision, _ = self._classify_internal(post)
+        decision, _, _ = self._classify_internal(post)
         return decision
 
-    def classify_with_metadata(self, post: PostForLLM) -> tuple[LLMDecision, str]:
+    def classify_with_metadata(self, post: PostForLLM) -> tuple[LLMDecision, str, int | None]:
         return self._classify_internal(post)

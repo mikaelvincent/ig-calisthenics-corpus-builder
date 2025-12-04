@@ -147,7 +147,7 @@ class OpenAIPostClassifier:
         except Exception as e:
             raise LLMError(f"Failed to parse structured output ({model}): {e}") from e
 
-    def classify(self, post: PostForLLM) -> LLMDecision:
+    def _classify_internal(self, post: PostForLLM) -> tuple[LLMDecision, str]:
         if not (post.url or "").strip():
             raise ValueError("post.url must be non-empty")
 
@@ -164,13 +164,20 @@ class OpenAIPostClassifier:
             if escalation_model is None:
                 raise
             raw_escalation = self._call_raw(model=escalation_model, post=post)
-            return self._parse_decision(raw_escalation, model=escalation_model)
+            return self._parse_decision(raw_escalation, model=escalation_model), escalation_model
 
         if (
             escalation_model is not None
             and decision_primary.overall_confidence < self._cfg.escalation_confidence_threshold
         ):
             raw_escalation = self._call_raw(model=escalation_model, post=post)
-            return self._parse_decision(raw_escalation, model=escalation_model)
+            return self._parse_decision(raw_escalation, model=escalation_model), escalation_model
 
-        return decision_primary
+        return decision_primary, primary_model
+
+    def classify(self, post: PostForLLM) -> LLMDecision:
+        decision, _ = self._classify_internal(post)
+        return decision
+
+    def classify_with_metadata(self, post: PostForLLM) -> tuple[LLMDecision, str]:
+        return self._classify_internal(post)

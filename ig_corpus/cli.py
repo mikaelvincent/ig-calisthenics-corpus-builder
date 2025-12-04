@@ -51,6 +51,16 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Output directory for state and logs.",
     )
+    run.add_argument(
+        "--run-id",
+        default=None,
+        help="Run identifier to create or resume in the state DB.",
+    )
+    run.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume the most recent unfinished run in the state DB.",
+    )
     run.set_defaults(_handler=_cmd_run)
 
     return parser
@@ -91,11 +101,19 @@ def _cmd_run(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     log_path = out_dir / "run.log"
-    with RunLogger.open(log_path, overwrite=True) as log:
+    requested_run_id = (getattr(args, "run_id", None) or "").strip() or None
+    resume_requested = bool(getattr(args, "resume", False))
+
+    # When resuming, keep existing logs and append.
+    overwrite_log = not (resume_requested or requested_run_id is not None)
+
+    with RunLogger.open(log_path, overwrite=overwrite_log) as log:
         log.info(
             "run_command_started",
             config_path=str(args.config),
             out_dir=str(out_dir),
+            requested_run_id=requested_run_id,
+            resume_requested=resume_requested,
         )
 
         try:
@@ -114,7 +132,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
             pdf_path = out_dir / "codebook.pdf"
 
             with SQLiteStateStore.open(db_path) as store:
-                result = run_feedback_loop(cfg, secrets, store=store, logger=log)
+                result = run_feedback_loop(
+                    cfg,
+                    secrets,
+                    store=store,
+                    logger=log,
+                    run_id=requested_run_id,
+                    resume=resume_requested,
+                )
 
                 log.info(
                     "feedback_loop_completed",
@@ -124,6 +149,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                     raw_posts=result.raw_posts,
                     decisions=result.decisions,
                     eligible=result.eligible,
+                    resumed=bool(result.resumed),
                 )
 
                 log.info("export_excel_started", path=str(xlsx_path))
@@ -136,6 +162,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
             print(f"status={result.status}")
             print(f"run_id={result.run_id}")
+            print(f"resumed={result.resumed}")
             print(f"iterations={result.iterations}")
             print(f"raw_posts={result.raw_posts}")
             print(f"decisions={result.decisions}")

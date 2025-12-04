@@ -28,7 +28,7 @@ openai:
   model_primary: gpt-5-nano
   model_escalation: gpt-5-mini
   escalation_confidence_threshold: 0.70
-  max_output_tokens: 100
+  max_output_tokens: 16000
 
 filters:
   min_caption_chars: 40

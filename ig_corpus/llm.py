@@ -42,6 +42,15 @@ Guidelines:
 overall_confidence is 0–1.
 """
 
+_TEXT_FORMAT: dict[str, Any] = {
+    "format": {
+        "type": "json_schema",
+        "name": DECISION_SCHEMA_NAME,
+        "strict": True,
+        "schema": DECISION_JSON_SCHEMA,
+    }
+}
+
 
 @dataclass(frozen=True)
 class PostForLLM:
@@ -90,6 +99,9 @@ def _extract_output_text(response: Any) -> str:
 class OpenAIPostClassifier:
     """
     Minimal OpenAI wrapper for one-post-per-call labeling with Structured Outputs.
+
+    Uses the primary model by default, and escalates to a larger model when confidence is low
+    or when the structured output cannot be parsed.
     """
 
     def __init__(
@@ -106,32 +118,59 @@ class OpenAIPostClassifier:
         self._cfg = openai_cfg
         self._client: _OpenAIClient = client or OpenAI(api_key=key)
 
-    def classify(self, post: PostForLLM) -> LLMDecision:
-        if not (post.url or "").strip():
-            raise ValueError("post.url must be non-empty")
+    def _escalation_model(self) -> str | None:
+        primary = (self._cfg.model_primary or "").strip()
+        escalation = (self._cfg.model_escalation or "").strip()
+        if not escalation or escalation == primary:
+            return None
+        return escalation
 
+    def _call_raw(self, *, model: str, post: PostForLLM) -> str:
         try:
             response = self._client.responses.create(
-                model=self._cfg.model_primary,
+                model=model,
                 instructions=_SYSTEM_INSTRUCTIONS,
                 input=[
                     {"role": "user", "content": _build_user_message(post)},
                 ],
-                text={
-                    "format": {
-                        "type": "json_schema",
-                        "name": DECISION_SCHEMA_NAME,
-                        "strict": True,
-                        "schema": DECISION_JSON_SCHEMA,
-                    }
-                },
+                text=_TEXT_FORMAT,
                 max_output_tokens=self._cfg.max_output_tokens,
             )
         except Exception as e:
-            raise LLMError(f"OpenAI call failed: {e}") from e
+            raise LLMError(f"OpenAI call failed ({model}): {e}") from e
 
-        raw = _extract_output_text(response)
+        return _extract_output_text(response)
+
+    def _parse_decision(self, raw: str, *, model: str) -> LLMDecision:
         try:
             return LLMDecision.model_validate_json(raw)
         except Exception as e:
-            raise LLMError(f"Failed to parse structured output: {e}") from e
+            raise LLMError(f"Failed to parse structured output ({model}): {e}") from e
+
+    def classify(self, post: PostForLLM) -> LLMDecision:
+        if not (post.url or "").strip():
+            raise ValueError("post.url must be non-empty")
+
+        primary_model = (self._cfg.model_primary or "").strip()
+        if not primary_model:
+            raise ValueError("openai_cfg.model_primary must be non-empty")
+
+        escalation_model = self._escalation_model()
+
+        raw_primary = self._call_raw(model=primary_model, post=post)
+        try:
+            decision_primary = self._parse_decision(raw_primary, model=primary_model)
+        except LLMError:
+            if escalation_model is None:
+                raise
+            raw_escalation = self._call_raw(model=escalation_model, post=post)
+            return self._parse_decision(raw_escalation, model=escalation_model)
+
+        if (
+            escalation_model is not None
+            and decision_primary.overall_confidence < self._cfg.escalation_confidence_threshold
+        ):
+            raw_escalation = self._call_raw(model=escalation_model, post=post)
+            return self._parse_decision(raw_escalation, model=escalation_model)
+
+        return decision_primary

@@ -10,6 +10,7 @@ from .config import load_config, resolve_runtime_secrets
 from .dry_run import run_dry_run
 from .errors import ApifyError, ConfigError, ExportError, LLMError, StorageError
 from .export_excel import export_corpus_workbook
+from .export_pdf import export_codebook_pdf
 from .loop import run_feedback_loop
 from .storage import SQLiteStateStore
 
@@ -78,10 +79,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     db_path = out_dir / "state.sqlite"
     xlsx_path = out_dir / "corpus.xlsx"
+    pdf_path = out_dir / "codebook.pdf"
 
     with SQLiteStateStore.open(db_path) as store:
         result = run_feedback_loop(cfg, secrets, store=store)
         export_corpus_workbook(cfg, store, xlsx_path, run_id=result.run_id)
+        export_codebook_pdf(cfg, store, pdf_path, run_id=result.run_id)
 
     print(f"status={result.status}")
     print(f"run_id={result.run_id}")
@@ -90,6 +93,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     print(f"decisions={result.decisions}")
     print(f"eligible={result.eligible}")
     print(f"corpus_xlsx={xlsx_path}")
+    print(f"codebook_pdf={pdf_path}")
 
     return 0 if result.status == "completed_pool" else 4
 

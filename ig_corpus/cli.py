@@ -29,6 +29,11 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Path to YAML config file.",
     )
+    dry.add_argument(
+        "--offline",
+        action="store_true",
+        help="Run without network calls using a small stub dataset.",
+    )
     dry.set_defaults(_handler=_cmd_dry_run)
 
     run = subparsers.add_parser(
@@ -58,7 +63,17 @@ def _cmd_dry_run(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     secrets = resolve_runtime_secrets(cfg)
 
-    result = run_dry_run(cfg, secrets)
+    if bool(getattr(args, "offline", False)):
+        from .offline import OfflineInstagramHashtagScraper, OfflinePostClassifier
+
+        result = run_dry_run(
+            cfg,
+            secrets,
+            scraper=OfflineInstagramHashtagScraper(),
+            classifier=OfflinePostClassifier(),
+        )
+    else:
+        result = run_dry_run(cfg, secrets)
 
     print(f"scraped_count={result.scraped_count}")
     print(f"processed_count={result.processed_count}")

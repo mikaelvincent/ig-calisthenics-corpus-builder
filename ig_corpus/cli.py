@@ -8,7 +8,8 @@ from typing import Sequence
 
 from .config import load_config, resolve_runtime_secrets
 from .dry_run import run_dry_run
-from .errors import ApifyError, ConfigError, LLMError, StorageError
+from .errors import ApifyError, ConfigError, ExportError, LLMError, StorageError
+from .export_excel import export_corpus_workbook
 from .loop import run_feedback_loop
 from .storage import SQLiteStateStore
 
@@ -76,8 +77,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     db_path = out_dir / "state.sqlite"
+    xlsx_path = out_dir / "corpus.xlsx"
+
     with SQLiteStateStore.open(db_path) as store:
         result = run_feedback_loop(cfg, secrets, store=store)
+        export_corpus_workbook(cfg, store, xlsx_path, run_id=result.run_id)
 
     print(f"status={result.status}")
     print(f"run_id={result.run_id}")
@@ -85,6 +89,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     print(f"raw_posts={result.raw_posts}")
     print(f"decisions={result.decisions}")
     print(f"eligible={result.eligible}")
+    print(f"corpus_xlsx={xlsx_path}")
 
     return 0 if result.status == "completed_pool" else 4
 
@@ -99,7 +104,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ConfigError as e:
         _eprint(str(e))
         return 2
-    except (ApifyError, LLMError, StorageError) as e:
+    except (ApifyError, LLMError, StorageError, ExportError) as e:
         _eprint(str(e))
         return 3
     except KeyboardInterrupt:

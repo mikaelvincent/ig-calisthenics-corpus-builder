@@ -13,6 +13,7 @@ from .apify_client import ActorRunRef, InstagramHashtagScraper, InstagramScraper
 from .config import RuntimeSecrets, config_sha256
 from .config_schema import AppConfig
 from .dedupe import dedupe_key
+from .final_sample import ensure_final_sample, fetch_eligible_pool_keys
 from .llm import OpenAIPostClassifier
 from .llm_schema import LLMDecision
 from .normalize import normalized_post_from_apify_item, post_for_llm
@@ -327,7 +328,7 @@ def run_feedback_loop(
             if not checks.passed:
                 continue
 
-            decision, model_used = post_classifier.classify_with_metadata(post_for_llm(post))
+            decision, model_used, tokens_total = post_classifier.classify_with_metadata(post_for_llm(post))
             decision = _apply_dominance_guard(
                 decision,
                 owner_username=post.owner_username,
@@ -341,6 +342,7 @@ def run_feedback_loop(
                 url=post.url,
                 model=model_used,
                 decision=decision,
+                tokens_total=tokens_total,
             )
             decision_total += 1
             processed += 1
@@ -358,6 +360,16 @@ def run_feedback_loop(
 
     for iteration in range(int(config.loop.max_iterations)):
         if eligible_total >= config.targets.pool_n:
+            pool_keys = fetch_eligible_pool_keys(store, limit=int(config.targets.pool_n))
+            ensure_final_sample(
+                store,
+                run_id=run_record.run_id,
+                pool_keys=pool_keys,
+                sampling_seed=int(config.targets.sampling_seed),
+                pool_n=int(config.targets.pool_n),
+                final_n=int(config.targets.final_n),
+                persist=len(pool_keys) >= int(config.targets.pool_n),
+            )
             store.finish_run(run_record.run_id)
             return FeedbackLoopResult(
                 run_id=run_record.run_id,

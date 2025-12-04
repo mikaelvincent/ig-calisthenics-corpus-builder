@@ -25,18 +25,21 @@ class _FakeResponse:
 
 
 class _FakeResponses:
-    def __init__(self, response: _FakeResponse) -> None:
-        self._response = response
+    def __init__(self, responses: list[_FakeResponse]) -> None:
+        self._responses = list(responses)
         self.calls: list[dict[str, Any]] = []
 
     def create(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
-        return self._response
+        if not self._responses:
+            raise AssertionError("Fake client received more calls than expected")
+        return self._responses.pop(0)
 
 
 class _FakeClient:
-    def __init__(self, response: _FakeResponse) -> None:
-        self.responses = _FakeResponses(response)
+    def __init__(self, response: _FakeResponse | list[_FakeResponse]) -> None:
+        responses = response if isinstance(response, list) else [response]
+        self.responses = _FakeResponses(responses)
 
 
 _DECISION_JSON = """\
@@ -58,6 +61,28 @@ _DECISION_JSON = """\
     "neoliberal_signals": []
   },
   "overall_confidence": 0.9
+}
+"""
+
+_DECISION_JSON_LOW_CONF = """\
+{
+  "eligible": true,
+  "eligibility_reasons": ["Unclear caption intent"],
+  "language": { "is_english": true, "confidence": 0.7 },
+  "topic": {
+    "is_bodyweight_calisthenics": true,
+    "confidence": 0.6,
+    "topic_notes": "Possible bodyweight training, but ambiguous."
+  },
+  "commercial": { "is_exclusively_commercial": false, "signals": [] },
+  "caption_quality": { "is_analyzable": true, "issues": ["fragmentary_caption"] },
+  "tags": {
+    "genre": "other",
+    "narrative_labels": [],
+    "discourse_moves": [],
+    "neoliberal_signals": []
+  },
+  "overall_confidence": 0.4
 }
 """
 
@@ -96,6 +121,51 @@ class TestOpenAIPostClassifier(unittest.TestCase):
 
         self.assertTrue(decision.eligible)
         self.assertEqual(decision.language.is_english, True)
+
+    def test_classify_escalates_on_low_confidence(self) -> None:
+        cfg = OpenAIConfig(
+            model_primary="gpt-5-nano",
+            model_escalation="gpt-5-mini",
+            escalation_confidence_threshold=0.70,
+            max_output_tokens=80,
+        )
+        fake = _FakeClient(
+            [
+                _FakeResponse(output_text=_DECISION_JSON_LOW_CONF),
+                _FakeResponse(output_text=_DECISION_JSON),
+            ]
+        )
+        classifier = OpenAIPostClassifier("sk-test", openai_cfg=cfg, client=fake)  # type: ignore[arg-type]
+
+        decision = classifier.classify(PostForLLM(url="https://example.com/p/lowconf", caption="Hi"))
+
+        self.assertTrue(decision.eligible)
+        self.assertGreaterEqual(decision.overall_confidence, 0.70)
+        self.assertEqual(len(fake.responses.calls), 2)
+        self.assertEqual(fake.responses.calls[0]["model"], "gpt-5-nano")
+        self.assertEqual(fake.responses.calls[1]["model"], "gpt-5-mini")
+
+    def test_classify_escalates_on_parse_failure(self) -> None:
+        cfg = OpenAIConfig(
+            model_primary="gpt-5-nano",
+            model_escalation="gpt-5-mini",
+            escalation_confidence_threshold=0.70,
+            max_output_tokens=80,
+        )
+        fake = _FakeClient(
+            [
+                _FakeResponse(output_text="{not-json"),
+                _FakeResponse(output_text=_DECISION_JSON),
+            ]
+        )
+        classifier = OpenAIPostClassifier("sk-test", openai_cfg=cfg, client=fake)  # type: ignore[arg-type]
+
+        decision = classifier.classify(PostForLLM(url="https://example.com/p/badjson", caption="Hi"))
+
+        self.assertTrue(decision.eligible)
+        self.assertEqual(len(fake.responses.calls), 2)
+        self.assertEqual(fake.responses.calls[0]["model"], "gpt-5-nano")
+        self.assertEqual(fake.responses.calls[1]["model"], "gpt-5-mini")
 
 
 if __name__ == "__main__":

@@ -107,7 +107,8 @@ class ExpansionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     enabled: bool = True
-    max_new_terms_per_iter: PositiveInt = 15
+    # Allow zero when expansion is disabled; enforce >=1 when enabled via model validator.
+    max_new_terms_per_iter: NonNegativeInt = 15
     min_hashtag_freq_in_eligible: PositiveInt = 4
     blocklist_terms: list[str] = Field(default_factory=list)
 
@@ -115,6 +116,12 @@ class ExpansionConfig(BaseModel):
     @classmethod
     def _normalize_blocklist(cls, v: list[str]) -> list[str]:
         return _normalize_term_list(v, allow_empty=True)
+
+    @model_validator(mode="after")
+    def _validate_when_enabled(self) -> "ExpansionConfig":
+        if self.enabled and self.max_new_terms_per_iter <= 0:
+            raise ValueError("max_new_terms_per_iter must be >= 1 when expansion is enabled")
+        return self
 
 
 class QueryingConfig(BaseModel):

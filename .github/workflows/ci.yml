@@ -22,12 +22,15 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run unit tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -m unittest discover -v
+          python -m unittest discover -s tests -p "test_*.py" -v
 
       - name: Minimal dry-run smoke (offline)
         env:
           APIFY_TOKEN: dummy
           OPENAI_API_KEY: dummy
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           python -m ig_corpus dry-run --config config.yaml --offline

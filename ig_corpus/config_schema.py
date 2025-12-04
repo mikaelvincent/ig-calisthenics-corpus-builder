@@ -77,6 +77,7 @@ class OpenAIConfig(BaseModel):
     model_escalation: str = "gpt-5-mini"
     escalation_confidence_threshold: float = Field(0.70, ge=0.0, le=1.0)
     max_output_tokens: PositiveInt = 16000
+    max_concurrent_requests: PositiveInt = 4
 
     @field_validator("api_key_env")
     @classmethod

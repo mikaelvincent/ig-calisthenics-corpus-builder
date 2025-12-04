@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import random
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -12,6 +11,12 @@ import yaml
 
 from .config_schema import AppConfig
 from .errors import ExportError
+from .final_sample import (
+    ensure_final_sample,
+    load_final_sample_keys,
+    load_final_sample_meta,
+    pool_keys_sha256,
+)
 from .llm_schema import LLMDecision
 from .normalize import normalized_post_from_apify_item
 from .storage import SQLiteStateStore
@@ -63,6 +68,16 @@ def _loads_json_object(raw: str) -> dict[str, Any]:
     if not isinstance(val, dict):
         raise ExportError("Stored JSON was not an object")
     return val
+
+
+def _db_scalar_int(store: SQLiteStateStore, sql: str, params: tuple[Any, ...] = ()) -> int:
+    row = store.conn.execute(sql, params).fetchone()
+    if row is None:
+        return 0
+    try:
+        return int(row[0])
+    except Exception:
+        return 0
 
 
 def _fetch_latest_posts_with_decisions(
@@ -117,6 +132,7 @@ def _flatten_row(
     fetched_at: str,
     raw_json: str,
     model: str,
+    tokens_total: int | None,
     decided_at: str,
     overall_confidence: float,
     decision_json: str,
@@ -170,6 +186,7 @@ def _flatten_row(
         "fetched_at": _safe_excel_text(fetched_at),
         "decided_at": _safe_excel_text(decided_at),
         "model": _safe_excel_text(model),
+        "tokens_total": int(tokens_total) if tokens_total is not None else None,
         "overall_confidence": float(overall_confidence),
         "language_is_english": bool(decision.language.is_english),
         "language_confidence": float(decision.language.confidence),
@@ -188,23 +205,6 @@ def _flatten_row(
         "selected_final": bool(selected_final),
     }
     return row, decision
-
-
-def _pick_final_keys(
-    pool_keys: list[str],
-    *,
-    final_n: int,
-    seed: int,
-) -> set[str]:
-    if final_n <= 0:
-        return set()
-    if not pool_keys:
-        return set()
-
-    n = min(final_n, len(pool_keys))
-    rng = random.Random(int(seed))
-    chosen = rng.sample(pool_keys, k=n)
-    return set(chosen)
 
 
 def _fetch_actor_runs(store: SQLiteStateStore, *, run_id: str) -> list[dict[str, Any]]:
@@ -262,11 +262,28 @@ def export_corpus_workbook(
     )
 
     pool_keys = [str(r["post_key"]) for r in pool_raw if str(r.get("post_key") or "").strip()]
-    final_keys = _pick_final_keys(pool_keys, final_n=final_n, seed=seed)
+    pool_sha = pool_keys_sha256(pool_keys)
+
+    meta = load_final_sample_meta(store, run_id=run_id)
+    if meta is not None:
+        final_keys = load_final_sample_keys(store, run_id=run_id)
+    else:
+        final_keys, meta = ensure_final_sample(
+            store,
+            run_id=run_id,
+            pool_keys=pool_keys,
+            sampling_seed=seed,
+            pool_n=pool_limit,
+            final_n=final_n,
+            persist=len(pool_keys) >= pool_limit,
+        )
 
     genre_counts: Counter[str] = Counter()
     narrative_counts: Counter[str] = Counter()
+    discourse_counts: Counter[str] = Counter()
     neoliberal_counts: Counter[str] = Counter()
+    hashtag_counts: Counter[str] = Counter()
+    model_counts: Counter[str] = Counter()
 
     pool_rows: list[dict[str, Any]] = []
     for r in pool_raw:
@@ -279,6 +296,7 @@ def export_corpus_workbook(
             fetched_at=str(r["fetched_at"]),
             raw_json=str(r["raw_json"]),
             model=str(r["model"]),
+            tokens_total=int(r["tokens_total"]) if r["tokens_total"] is not None else None,
             decided_at=str(r["decided_at"]),
             overall_confidence=float(r["overall_confidence"]),
             decision_json=str(r["decision_json"]),
@@ -286,11 +304,30 @@ def export_corpus_workbook(
         )
         pool_rows.append(row)
 
+        model_counts[str(r["model"])] += 1
         genre_counts[str(decision.tags.genre)] += 1
+
         for lab in decision.tags.narrative_labels:
-            narrative_counts[(lab or "").strip()] += 1
+            t = (lab or "").strip()
+            if t:
+                narrative_counts[t] += 1
+
+        for mv in decision.tags.discourse_moves:
+            t = (mv or "").strip()
+            if t:
+                discourse_counts[t] += 1
+
         for sig in decision.tags.neoliberal_signals:
-            neoliberal_counts[(sig or "").strip()] += 1
+            t = (sig or "").strip()
+            if t:
+                neoliberal_counts[t] += 1
+
+        hashtags_text = str(row.get("hashtags") or "").strip()
+        if hashtags_text:
+            for token in hashtags_text.split():
+                h = token.lstrip("#").strip()
+                if h:
+                    hashtag_counts[h] += 1
 
     final_rows = [r for r in pool_rows if bool(r.get("selected_final"))]
 
@@ -311,6 +348,7 @@ def export_corpus_workbook(
             fetched_at=str(r["fetched_at"]),
             raw_json=str(r["raw_json"]),
             model=str(r["model"]),
+            tokens_total=int(r["tokens_total"]) if r["tokens_total"] is not None else None,
             decided_at=str(r["decided_at"]),
             overall_confidence=float(r["overall_confidence"]),
             decision_json=str(r["decision_json"]),
@@ -328,9 +366,20 @@ def export_corpus_workbook(
         allow_unicode=True,
     )
 
+    schema_version = _db_scalar_int(store, "SELECT MAX(version) FROM schema_migrations")
+
+    tokens_used = _db_scalar_int(
+        store,
+        """
+        SELECT COALESCE(SUM(tokens_total), 0)
+        FROM llm_decisions
+        """.strip(),
+    )
+
     meta_rows: list[dict[str, Any]] = [
         {"key": "run_id", "value": _safe_excel_text(run_id)},
         {"key": "exported_at_utc", "value": _safe_excel_text(_utc_now_iso())},
+        {"key": "sqlite_schema_version", "value": int(schema_version)},
         {"key": "status_note", "value": _safe_excel_text("See sheets for outputs")},
         {"key": "targets.final_n", "value": final_n},
         {"key": "targets.pool_n", "value": pool_limit},
@@ -345,10 +394,14 @@ def export_corpus_workbook(
         {"key": "run.sampling_seed", "value": run.sampling_seed if run is not None else None},
         {"key": "versions_json", "value": _safe_excel_text(versions_json)},
         {"key": "config_yaml", "value": _safe_excel_text(config_yaml)},
+        {"key": "repro.pool_keys_sha256", "value": _safe_excel_text(pool_sha)},
         {
-            "key": "final_post_keys_json",
+            "key": "repro.final_post_keys_json",
             "value": _safe_excel_text(json.dumps(sorted(final_keys), ensure_ascii=False)),
         },
+        {"key": "repro.final_sample_recorded", "value": bool(meta is not None)},
+        {"key": "repro.final_sample_recorded_at", "value": _safe_excel_text(meta.created_at if meta is not None else None)},
+        {"key": "counts.llm_tokens_total_all_time", "value": int(tokens_used)},
         {"key": "output_path", "value": _safe_excel_text(str(out))},
     ]
 
@@ -358,16 +411,26 @@ def export_corpus_workbook(
     for genre, n in genre_counts.most_common():
         if (genre or "").strip():
             tag_rows.append({"kind": "genre", "label": _safe_excel_text(genre), "count": int(n)})
-    for lab, n in narrative_counts.most_common(100):
+
+    for lab, n in narrative_counts.most_common(200):
         if (lab or "").strip():
-            tag_rows.append(
-                {"kind": "narrative_label", "label": _safe_excel_text(lab), "count": int(n)}
-            )
-    for sig, n in neoliberal_counts.most_common(100):
+            tag_rows.append({"kind": "narrative_label", "label": _safe_excel_text(lab), "count": int(n)})
+
+    for mv, n in discourse_counts.most_common(200):
+        if (mv or "").strip():
+            tag_rows.append({"kind": "discourse_move", "label": _safe_excel_text(mv), "count": int(n)})
+
+    for sig, n in neoliberal_counts.most_common(200):
         if (sig or "").strip():
-            tag_rows.append(
-                {"kind": "neoliberal_signal", "label": _safe_excel_text(sig), "count": int(n)}
-            )
+            tag_rows.append({"kind": "neoliberal_signal", "label": _safe_excel_text(sig), "count": int(n)})
+
+    for h, n in hashtag_counts.most_common(200):
+        if (h or "").strip():
+            tag_rows.append({"kind": "hashtag", "label": _safe_excel_text(h), "count": int(n)})
+
+    for m, n in model_counts.most_common():
+        if (m or "").strip():
+            tag_rows.append({"kind": "model", "label": _safe_excel_text(m), "count": int(n)})
 
     df_final = pd.DataFrame(final_rows)
     df_pool = pd.DataFrame(pool_rows)

@@ -11,6 +11,7 @@ from .dry_run import run_dry_run
 from .errors import ApifyError, ConfigError, ExportError, LLMError, StorageError
 from .export_excel import export_corpus_workbook
 from .export_pdf import export_codebook_pdf
+from .failure_report import format_failure_report
 from .loop import run_feedback_loop
 from .run_log import RunLogger
 from .storage import SQLiteStateStore
@@ -141,6 +142,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
                     resume=resume_requested,
                 )
 
+                failure_summary = (
+                    str(result.failure_report.get("summary") or "")
+                    if isinstance(result.failure_report, dict)
+                    else None
+                )
+
                 log.info(
                     "feedback_loop_completed",
                     status=result.status,
@@ -150,6 +157,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                     decisions=result.decisions,
                     eligible=result.eligible,
                     resumed=bool(result.resumed),
+                    failure_summary=failure_summary or None,
                 )
 
                 log.info("export_excel_started", path=str(xlsx_path))
@@ -170,6 +178,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
             print(f"corpus_xlsx={xlsx_path}")
             print(f"codebook_pdf={pdf_path}")
             print(f"run_log={log_path}")
+
+            if isinstance(result.failure_report, dict) and result.failure_report:
+                _eprint(format_failure_report(result.failure_report))
+                print("failure_report=")
+                print(json.dumps(result.failure_report, indent=2, ensure_ascii=False, sort_keys=True))
 
             return 0 if result.status == "completed_pool" else 4
         except Exception as e:

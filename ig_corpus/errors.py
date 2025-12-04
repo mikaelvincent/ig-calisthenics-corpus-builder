@@ -11,3 +11,7 @@ class ApifyError(RuntimeError):
 
 class LLMError(RuntimeError):
     """Raised when an OpenAI model call or structured parse fails."""
+
+
+class StorageError(RuntimeError):
+    """Raised when reading or writing state in SQLite fails."""

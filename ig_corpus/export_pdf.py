@@ -154,6 +154,7 @@ def export_codebook_pdf(
         ("openai_model_primary", config.openai.model_primary),
         ("openai_model_escalation", config.openai.model_escalation),
         ("escalation_conf_threshold", str(float(config.openai.escalation_confidence_threshold))),
+        ("openai_max_concurrent_requests", str(int(config.openai.max_concurrent_requests))),
         ("min_caption_chars", str(int(config.filters.min_caption_chars))),
         ("max_posts_per_user", str(int(config.filters.max_posts_per_user))),
         ("allow_reels", str(bool(config.filters.allow_reels))),

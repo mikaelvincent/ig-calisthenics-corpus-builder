@@ -47,6 +47,7 @@ def build_methods_overview(config: AppConfig, data: CodebookData) -> MethodsOver
     model_primary = (config.openai.model_primary or "").strip() or "gpt-5-nano"
     model_escalation = (config.openai.model_escalation or "").strip()
     esc_threshold = float(config.openai.escalation_confidence_threshold)
+    openai_concurrency = int(config.openai.max_concurrent_requests)
 
     stagnation_window = int(config.loop.stagnation_window)
     stagnation_min_new = int(config.loop.stagnation_min_new_eligible)
@@ -100,6 +101,7 @@ def build_methods_overview(config: AppConfig, data: CodebookData) -> MethodsOver
             "Each candidate post is labeled using Structured Outputs so results conform to a strict JSON schema. "
             f"The primary labeling model is `{model_primary}`."
             f"{escalation_clause}"
+            f" Labeling runs with up to {openai_concurrency} concurrent OpenAI requests."
         ),
         (
             "Deterministic gatekeeping complements model outputs: captions must meet basic analyzability thresholds "
@@ -118,7 +120,7 @@ def build_methods_overview(config: AppConfig, data: CodebookData) -> MethodsOver
         ),
         "Deduplicate posts by stable keys (id/shortcode/url) and apply fast prechecks to avoid unnecessary LLM calls.",
         (
-            f"Label candidates one at a time with `{model_primary}` using a strict JSON schema; "
+            f"Label candidates with `{model_primary}` using a strict JSON schema (up to {openai_concurrency} concurrent calls); "
             "compute eligibility from structured fields and apply the per-user dominance guard."
         ),
         (

@@ -8,6 +8,7 @@ from xml.sax.saxutils import escape
 from .codebook import CodebookData, collect_codebook_data
 from .config_schema import AppConfig
 from .errors import ExportError
+from .final_sample import load_final_sample_meta
 from .storage import SQLiteStateStore
 
 
@@ -49,6 +50,7 @@ def export_codebook_pdf(
     out.parent.mkdir(parents=True, exist_ok=True)
 
     data: CodebookData = collect_codebook_data(config, store, run_id=run_id)
+    sample_meta = load_final_sample_meta(store, run_id=run_id)
 
     styles = getSampleStyleSheet()
     h1 = styles["Heading1"]
@@ -135,6 +137,13 @@ def export_codebook_pdf(
         ("run_ended_at", run.ended_at if (run is not None and run.ended_at is not None) else "not_recorded"),
     ]
 
+    if sample_meta is not None:
+        run_rows.append(("pool_keys_sha256", sample_meta.pool_keys_sha256))
+        run_rows.append(("final_sample_recorded_at", sample_meta.created_at))
+    else:
+        run_rows.append(("pool_keys_sha256", "not_recorded"))
+        run_rows.append(("final_sample_recorded_at", "not_recorded"))
+
     cfg_rows: list[tuple[str, str]] = [
         ("primary_actor", config.apify.primary_actor),
         ("fallback_actor", config.apify.fallback_actor),
@@ -215,6 +224,8 @@ def export_codebook_pdf(
     story.extend(top_table("Top genres", data.stats.top_genres, limit=20))
     story.append(Spacer(1, 10))
     story.extend(top_table("Top narrative labels", data.stats.top_narrative_labels, limit=25))
+    story.append(Spacer(1, 10))
+    story.extend(top_table("Top discourse moves", data.stats.top_discourse_moves, limit=25))
     story.append(Spacer(1, 10))
     story.extend(top_table("Top neoliberal signals", data.stats.top_neoliberal_signals, limit=25))
     story.append(Spacer(1, 10))

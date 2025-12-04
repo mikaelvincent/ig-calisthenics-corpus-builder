@@ -68,6 +68,7 @@ class CodebookStats:
     top_hashtags: list[tuple[str, int]]
     top_genres: list[tuple[str, int]]
     top_narrative_labels: list[tuple[str, int]]
+    top_discourse_moves: list[tuple[str, int]]
     top_neoliberal_signals: list[tuple[str, int]]
 
 
@@ -171,6 +172,7 @@ def collect_codebook_data(config: AppConfig, store: SQLiteStateStore, *, run_id:
     hashtag_counts: Counter[str] = Counter()
     genre_counts: Counter[str] = Counter()
     narrative_counts: Counter[str] = Counter()
+    discourse_counts: Counter[str] = Counter()
     neoliberal_counts: Counter[str] = Counter()
 
     for _, raw_json, decision_json in eligible_rows:
@@ -200,6 +202,11 @@ def collect_codebook_data(config: AppConfig, store: SQLiteStateStore, *, run_id:
             if t:
                 narrative_counts[t] += 1
 
+        for mv in decision.tags.discourse_moves:
+            t = (mv or "").strip()
+            if t:
+                discourse_counts[t] += 1
+
         for sig in decision.tags.neoliberal_signals:
             t = (sig or "").strip()
             if t:
@@ -209,6 +216,7 @@ def collect_codebook_data(config: AppConfig, store: SQLiteStateStore, *, run_id:
         top_hashtags=_top(hashtag_counts, limit=25),
         top_genres=_top(genre_counts, limit=20),
         top_narrative_labels=_top(narrative_counts, limit=25),
+        top_discourse_moves=_top(discourse_counts, limit=25),
         top_neoliberal_signals=_top(neoliberal_counts, limit=25),
     )
 

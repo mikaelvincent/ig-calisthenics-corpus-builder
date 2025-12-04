@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _utc_now_iso() -> str:
@@ -121,7 +121,48 @@ FROM raw_posts p
 JOIN latest_llm_decisions d
   ON d.post_key = p.post_key
 WHERE d.eligible = 1;
-""".strip()
+""".strip(),
+    2: """
+CREATE TABLE IF NOT EXISTS final_sample_runs (
+  run_id TEXT PRIMARY KEY,
+  sampling_seed INTEGER NOT NULL,
+  pool_n INTEGER NOT NULL,
+  final_n INTEGER NOT NULL,
+  pool_keys_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS final_samples (
+  run_id TEXT NOT NULL,
+  post_key TEXT NOT NULL,
+  PRIMARY KEY (run_id, post_key),
+  FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE,
+  FOREIGN KEY (post_key) REFERENCES raw_posts(post_key) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_final_samples_run_id
+  ON final_samples(run_id);
+
+CREATE VIEW IF NOT EXISTS final_sample_posts AS
+SELECT
+  s.run_id,
+  p.post_key,
+  p.url,
+  p.actor_source,
+  p.fetched_at,
+  p.raw_json,
+  d.model,
+  d.overall_confidence,
+  d.tokens_total,
+  d.created_at AS decided_at,
+  d.decision_json
+FROM final_samples s
+JOIN raw_posts p
+  ON p.post_key = s.post_key
+JOIN latest_llm_decisions d
+  ON d.post_key = p.post_key;
+""".strip(),
 }
 
 

@@ -13,6 +13,7 @@ from .apify_client import ActorRunRef, InstagramHashtagScraper, InstagramScraper
 from .config import RuntimeSecrets, config_sha256
 from .config_schema import AppConfig
 from .dedupe import dedupe_key
+from .eligibility import enforce_structured_eligibility
 from .final_sample import ensure_final_sample, fetch_eligible_pool_keys
 from .llm import OpenAIPostClassifier
 from .llm_schema import LLMDecision
@@ -329,6 +330,7 @@ def run_feedback_loop(
                 continue
 
             decision, model_used, tokens_total = post_classifier.classify_with_metadata(post_for_llm(post))
+            decision = enforce_structured_eligibility(decision)
             decision = _apply_dominance_guard(
                 decision,
                 owner_username=post.owner_username,

@@ -184,6 +184,26 @@ class SQLiteStateStore:
             versions={str(k): str(v) for k, v in versions.items()},
         )
 
+    def latest_unfinished_run(self) -> RunRecord | None:
+        row = self._conn.execute(
+            """
+            SELECT run_id
+            FROM runs
+            WHERE ended_at IS NULL
+            ORDER BY started_at DESC, run_id DESC
+            LIMIT 1
+            """.strip()
+        ).fetchone()
+
+        if row is None:
+            return None
+
+        rid = (str(row["run_id"]) or "").strip()
+        if not rid:
+            return None
+
+        return self.get_run(rid)
+
     def record_apify_actor_run(
         self,
         *,

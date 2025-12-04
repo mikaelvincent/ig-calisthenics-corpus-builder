@@ -15,6 +15,7 @@ from .config_schema import AppConfig
 from .dedupe import dedupe_key
 from .eligibility import enforce_structured_eligibility
 from .errors import ConfigError, StorageError
+from .failure_report import build_failure_report
 from .final_sample import ensure_final_sample, fetch_eligible_pool_keys
 from .llm import OpenAIPostClassifier
 from .llm_schema import LLMDecision
@@ -35,6 +36,7 @@ class FeedbackLoopResult:
     decisions: int
     eligible: int
     resumed: bool
+    failure_report: dict[str, Any] | None = None
 
 
 def _pkg_version(name: str) -> str:
@@ -519,6 +521,18 @@ def run_feedback_loop(
             )
 
         if raw_total >= config.loop.max_raw_items:
+            report = build_failure_report(
+                status="max_raw_items",
+                config=config,
+                iterations=iteration,
+                raw_posts=raw_total,
+                decisions=decision_total,
+                eligible=eligible_total,
+            )
+
+            if logger is not None:
+                logger.error("run_failure_report", status=report["status"], report=report)
+
             store.finish_run(run_record.run_id)
 
             if logger is not None:
@@ -530,6 +544,7 @@ def run_feedback_loop(
                     decisions=decision_total,
                     eligible=eligible_total,
                     resumed=bool(resumed),
+                    failure_summary=str(report.get("summary") or ""),
                 )
 
             return FeedbackLoopResult(
@@ -540,6 +555,7 @@ def run_feedback_loop(
                 decisions=decision_total,
                 eligible=eligible_total,
                 resumed=bool(resumed),
+                failure_report=report,
             )
 
         batch = queue.pop_batch(int(config.apify.run_batch_queries))
@@ -548,6 +564,18 @@ def run_feedback_loop(
             batch = queue.pop_batch(int(config.apify.run_batch_queries))
 
         if not batch:
+            report = build_failure_report(
+                status="empty_query_queue",
+                config=config,
+                iterations=iteration,
+                raw_posts=raw_total,
+                decisions=decision_total,
+                eligible=eligible_total,
+            )
+
+            if logger is not None:
+                logger.error("run_failure_report", status=report["status"], report=report)
+
             store.finish_run(run_record.run_id)
 
             if logger is not None:
@@ -559,6 +587,7 @@ def run_feedback_loop(
                     decisions=decision_total,
                     eligible=eligible_total,
                     resumed=bool(resumed),
+                    failure_summary=str(report.get("summary") or ""),
                 )
 
             return FeedbackLoopResult(
@@ -569,6 +598,7 @@ def run_feedback_loop(
                 decisions=decision_total,
                 eligible=eligible_total,
                 resumed=bool(resumed),
+                failure_report=report,
             )
 
         for b in batch:
@@ -785,6 +815,19 @@ def run_feedback_loop(
         if config.loop.backoff_seconds > 0:
             time.sleep(float(config.loop.backoff_seconds))
 
+    report = build_failure_report(
+        status="max_iterations",
+        config=config,
+        iterations=int(config.loop.max_iterations),
+        raw_posts=raw_total,
+        decisions=decision_total,
+        eligible=eligible_total,
+        recent_new_eligible_total=int(stagnation.total()),
+    )
+
+    if logger is not None:
+        logger.error("run_failure_report", status=report["status"], report=report)
+
     store.finish_run(run_record.run_id)
 
     if logger is not None:
@@ -796,6 +839,7 @@ def run_feedback_loop(
             decisions=decision_total,
             eligible=eligible_total,
             resumed=bool(resumed),
+            failure_summary=str(report.get("summary") or ""),
         )
 
     return FeedbackLoopResult(
@@ -806,4 +850,5 @@ def run_feedback_loop(
         decisions=decision_total,
         eligible=eligible_total,
         resumed=bool(resumed),
+        failure_report=report,
     )

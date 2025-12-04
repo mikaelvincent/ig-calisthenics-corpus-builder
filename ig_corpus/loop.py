@@ -14,6 +14,7 @@ from .config import RuntimeSecrets, config_sha256
 from .config_schema import AppConfig
 from .dedupe import dedupe_key
 from .eligibility import enforce_structured_eligibility
+from .errors import ConfigError, StorageError
 from .final_sample import ensure_final_sample, fetch_eligible_pool_keys
 from .llm import OpenAIPostClassifier
 from .llm_schema import LLMDecision
@@ -33,6 +34,7 @@ class FeedbackLoopResult:
     raw_posts: int
     decisions: int
     eligible: int
+    resumed: bool
 
 
 def _pkg_version(name: str) -> str:
@@ -246,6 +248,8 @@ def run_feedback_loop(
     secrets: RuntimeSecrets,
     *,
     store: SQLiteStateStore,
+    run_id: str | None = None,
+    resume: bool = False,
     scraper: InstagramHashtagScraper | None = None,
     fallback_scraper: InstagramScraper | None = None,
     classifier: OpenAIPostClassifier | None = None,
@@ -268,22 +272,65 @@ def run_feedback_loop(
             apify_primary_actor=config.apify.primary_actor,
             apify_fallback_actor=config.apify.fallback_actor,
             apify_keyword_search=bool(config.apify.keyword_search),
+            requested_run_id=(run_id or "").strip() or None,
+            resume_requested=bool(resume),
         )
 
-    run_record = store.create_run(
-        config_hash=cfg_hash,
-        sampling_seed=config.targets.sampling_seed,
-        versions=versions,
-    )
+    requested_run_id = (run_id or "").strip() or None
+    resumed = False
 
-    if logger is not None:
-        logger.set_run_id(run_record.run_id)
-        logger.info(
-            "run_created",
-            run_id=run_record.run_id,
+    if resume and requested_run_id is None:
+        existing = store.latest_unfinished_run()
+        if existing is None:
+            raise StorageError("No unfinished run found to resume")
+        requested_run_id = existing.run_id
+
+    if requested_run_id is not None:
+        existing = store.get_run(requested_run_id)
+        if existing is None:
+            run_record = store.create_run(
+                config_hash=cfg_hash,
+                sampling_seed=int(config.targets.sampling_seed),
+                versions=versions,
+                run_id=requested_run_id,
+            )
+        else:
+            if existing.ended_at is not None:
+                raise StorageError(f"Run is already finished: {requested_run_id}")
+            if existing.config_hash != cfg_hash:
+                raise ConfigError(f"Config hash mismatch for run_id={requested_run_id}")
+            if (
+                existing.sampling_seed is not None
+                and int(existing.sampling_seed) != int(config.targets.sampling_seed)
+            ):
+                raise ConfigError(f"Sampling seed mismatch for run_id={requested_run_id}")
+            run_record = existing
+            resumed = True
+    else:
+        run_record = store.create_run(
+            config_hash=cfg_hash,
             sampling_seed=int(config.targets.sampling_seed),
             versions=versions,
         )
+
+    if logger is not None:
+        logger.set_run_id(run_record.run_id)
+        if resumed:
+            logger.info(
+                "run_resumed",
+                run_id=run_record.run_id,
+                started_at=run_record.started_at,
+                config_hash=run_record.config_hash,
+                sampling_seed=run_record.sampling_seed,
+                current_versions=versions,
+            )
+        else:
+            logger.info(
+                "run_created",
+                run_id=run_record.run_id,
+                sampling_seed=int(config.targets.sampling_seed),
+                versions=versions,
+            )
 
     primary = scraper or InstagramHashtagScraper(secrets.apify_token)
     fallback = fallback_scraper or InstagramScraper(secrets.apify_token)
@@ -458,6 +505,7 @@ def run_feedback_loop(
                     raw_posts=raw_total,
                     decisions=decision_total,
                     eligible=eligible_total,
+                    resumed=bool(resumed),
                 )
 
             return FeedbackLoopResult(
@@ -467,6 +515,7 @@ def run_feedback_loop(
                 raw_posts=raw_total,
                 decisions=decision_total,
                 eligible=eligible_total,
+                resumed=bool(resumed),
             )
 
         if raw_total >= config.loop.max_raw_items:
@@ -480,6 +529,7 @@ def run_feedback_loop(
                     raw_posts=raw_total,
                     decisions=decision_total,
                     eligible=eligible_total,
+                    resumed=bool(resumed),
                 )
 
             return FeedbackLoopResult(
@@ -489,6 +539,7 @@ def run_feedback_loop(
                 raw_posts=raw_total,
                 decisions=decision_total,
                 eligible=eligible_total,
+                resumed=bool(resumed),
             )
 
         batch = queue.pop_batch(int(config.apify.run_batch_queries))
@@ -507,6 +558,7 @@ def run_feedback_loop(
                     raw_posts=raw_total,
                     decisions=decision_total,
                     eligible=eligible_total,
+                    resumed=bool(resumed),
                 )
 
             return FeedbackLoopResult(
@@ -516,6 +568,7 @@ def run_feedback_loop(
                 raw_posts=raw_total,
                 decisions=decision_total,
                 eligible=eligible_total,
+                resumed=bool(resumed),
             )
 
         for b in batch:
@@ -742,6 +795,7 @@ def run_feedback_loop(
             raw_posts=raw_total,
             decisions=decision_total,
             eligible=eligible_total,
+            resumed=bool(resumed),
         )
 
     return FeedbackLoopResult(
@@ -751,4 +805,5 @@ def run_feedback_loop(
         raw_posts=raw_total,
         decisions=decision_total,
         eligible=eligible_total,
+        resumed=bool(resumed),
     )

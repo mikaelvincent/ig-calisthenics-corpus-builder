@@ -129,7 +129,7 @@ openai:
   model_primary: gpt-5-nano
   model_escalation: gpt-5-mini
   escalation_confidence_threshold: 0.70
-  max_output_tokens: 650
+  max_output_tokens: 16000
 
 filters:
   min_caption_chars: 40
@@ -187,7 +187,7 @@ querying:
 * `model_primary`: main model for one-post labeling
 * `model_escalation`: used when confidence is low or parsing fails
 * `escalation_confidence_threshold`: escalation cutoff for `overall_confidence`
-* `max_output_tokens`: cap for model output tokens
+* `max_output_tokens`: cap for model thinking + output tokens
 
 #### `filters`
 

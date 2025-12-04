@@ -15,14 +15,14 @@ def _decision(*, eligible: bool, confidence: float = 0.9) -> LLMDecision:
         "eligibility_reasons": ["ok" if eligible else "reject"],
         "language": {"is_english": True, "confidence": 0.9},
         "topic": {
-            "is_bodyweight_calisthenics": True,
-            "confidence": 0.9,
+            "is_bodyweight_calisthenics": bool(eligible),
+            "confidence": 0.9 if eligible else 0.1,
             "topic_notes": "test",
         },
         "commercial": {"is_exclusively_commercial": False, "signals": []},
         "caption_quality": {"is_analyzable": True, "issues": []},
         "tags": {
-            "genre": "training_log",
+            "genre": "training_log" if eligible else "other",
             "narrative_labels": [],
             "discourse_moves": [],
             "neoliberal_signals": [],

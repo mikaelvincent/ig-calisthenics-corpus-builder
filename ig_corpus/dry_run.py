@@ -8,6 +8,7 @@ from .apify_client import InstagramHashtagScraper
 from .config import RuntimeSecrets
 from .config_schema import AppConfig
 from .dedupe import SeenKeys, dedupe_key
+from .eligibility import enforce_structured_eligibility
 from .llm import OpenAIPostClassifier
 from .llm_schema import LLMDecision
 from .normalize import normalized_post_from_apify_item, post_for_llm
@@ -106,6 +107,7 @@ def run_dry_run(
             continue
 
         decision = post_classifier.classify(post_for_llm(normalized))
+        decision = enforce_structured_eligibility(decision)
         processed += 1
         if decision.eligible:
             eligible += 1

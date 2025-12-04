@@ -9,6 +9,7 @@ from .codebook import CodebookData, collect_codebook_data
 from .config_schema import AppConfig
 from .errors import ExportError
 from .final_sample import load_final_sample_meta
+from .methods_overview import build_methods_overview
 from .storage import SQLiteStateStore
 
 
@@ -185,6 +186,15 @@ def export_codebook_pdf(
         story.append(P("Environment versions", h3))
         story.append(Paragraph(escape(versions_lines).replace("\n", "<br/>"), mono))
         story.append(Spacer(1, 8))
+
+    overview = build_methods_overview(config, data)
+    story.append(P("Methods overview", h2))
+    for para in overview.paragraphs:
+        story.append(P(para, body))
+    if overview.steps:
+        story.append(Spacer(1, 4))
+        story.append(bullets(list(overview.steps)))
+    story.append(Spacer(1, 10))
 
     story.append(P("Configuration snapshot", h2))
     story.append(kv_table(cfg_rows))

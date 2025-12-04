@@ -153,6 +153,7 @@ class OpenAIPostClassifier:
         if not key:
             raise ValueError("api_key must be a non-empty string")
 
+        self._api_key = key
         self._cfg = openai_cfg
         self._retry = retry or _DEFAULT_OPENAI_RETRY
         self._on_retry = on_retry
@@ -162,7 +163,30 @@ class OpenAIPostClassifier:
         if client is not None:
             self._client = client
         else:
-            self._client = OpenAI(api_key=key, max_retries=0)
+            self._client = OpenAI(api_key=self._api_key, max_retries=0)
+
+    def fork(self) -> "OpenAIPostClassifier":
+        """
+        Create a new classifier instance with the same configuration.
+
+        This is intended for running concurrent labeling without sharing an underlying HTTP
+        client across threads.
+        """
+        return OpenAIPostClassifier(
+            self._api_key,
+            openai_cfg=self._cfg,
+            retry=self._retry,
+            on_retry=self._on_retry,
+            sleep_fn=self._sleep_fn,
+        )
+
+    def close(self) -> None:
+        closer = getattr(self._client, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:
+                pass
 
     def _escalation_model(self) -> str | None:
         primary = (self._cfg.model_primary or "").strip()

@@ -87,6 +87,21 @@ class TestExportExcel(unittest.TestCase):
 
                 export_corpus_workbook(cfg, store, out_path, run_id="run_test")
 
+                # Pool target is met, so a final sample should be persisted.
+                row = store.conn.execute(
+                    "SELECT COUNT(1) FROM final_sample_runs WHERE run_id = ?",
+                    ("run_test",),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                self.assertEqual(int(row[0]), 1)
+
+                row2 = store.conn.execute(
+                    "SELECT COUNT(1) FROM final_samples WHERE run_id = ?",
+                    ("run_test",),
+                ).fetchone()
+                self.assertIsNotNone(row2)
+                self.assertEqual(int(row2[0]), 1)
+
             self.assertTrue(out_path.exists())
 
             wb = load_workbook(out_path)

@@ -29,7 +29,11 @@ Use ONLY the provided fields (caption/hashtags/alt/type/isSponsored/etc.). Do no
 Return a JSON object that matches the provided schema EXACTLY.
 
 Guidelines:
-- English-only: reject if mostly non-English or too mixed to analyze.
+- Strict English-only captions: accept ONLY if the caption text is entirely English.
+  Reject if the caption includes ANY non-English sentence, phrase, translation, or mixes languages,
+  even when an English translation is provided.
+  Ignore emojis, punctuation, numbers, URLs, @mentions, and standalone hashtags when judging caption language.
+  If you are not extremely sure the caption is English-only, set language.is_english=false.
 - Topic: accept only if clearly about calisthenics / street workout / bodyweight training, skills, progressions, rehab related to bodyweight work.
   Reject gym-only weightlifting/bodybuilding/crossfit/yoga/parkour/bouldering.
 - Caption quality: reject if empty/emoji-only/hashtag-only or too fragmentary to analyze.

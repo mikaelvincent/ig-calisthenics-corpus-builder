@@ -18,7 +18,7 @@ openai:
   model_escalation: gpt-5-mini
   escalation_confidence_threshold: 0.70
   max_output_tokens: 16000
-  max_concurrent_requests: 4
+  max_concurrent_requests: 16
 
 filters:
   min_caption_chars: 40

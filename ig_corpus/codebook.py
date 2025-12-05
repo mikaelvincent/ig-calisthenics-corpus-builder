@@ -12,7 +12,7 @@ from .storage import RunRecord, SQLiteStateStore
 
 
 INCLUSION_RULES: tuple[str, ...] = (
-    "Caption language is English (reject if mostly non-English or too mixed).",
+    "Caption language is strictly English (reject if any non-English text, including translations).",
     "Content is clearly about calisthenics / street workout / bodyweight training.",
     "Caption is linguistically analyzable (reject empty/emoji-only/hashtag-only).",
     "Not exclusively commercial (reject pure ads/discount codes with no training substance).",

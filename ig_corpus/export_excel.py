@@ -25,6 +25,24 @@ from .storage import SQLiteStateStore
 _EXCEL_FORMULA_PREFIXES = ("=", "+", "-", "@")
 
 
+def _final_sheet_name(final_n: int) -> str:
+    """
+    Build an Excel sheet name for the final sample.
+
+    Excel limits sheet names to 31 characters; keep names short and deterministic.
+    """
+    try:
+        n = int(final_n)
+    except Exception:
+        n = 0
+
+    n = max(0, n)
+    name = f"final{n}"
+    if 1 <= len(name) <= 31:
+        return name
+    return "final_sample"
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -253,6 +271,7 @@ def export_corpus_workbook(
     pool_limit = int(config.targets.pool_n)
     final_n = int(config.targets.final_n)
     seed = int(config.targets.sampling_seed)
+    final_sheet = _final_sheet_name(final_n)
 
     pool_raw = _fetch_latest_posts_with_decisions(
         store,
@@ -441,7 +460,7 @@ def export_corpus_workbook(
 
     try:
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
-            df_final.to_excel(writer, sheet_name="final500", index=False)
+            df_final.to_excel(writer, sheet_name=final_sheet, index=False)
             df_pool.to_excel(writer, sheet_name="eligible_pool", index=False)
             df_rejected.to_excel(writer, sheet_name="rejected", index=False)
 
@@ -452,7 +471,7 @@ def export_corpus_workbook(
             df_tags.to_excel(writer, sheet_name="tag_summary", index=False)
 
             wb = writer.book
-            for name in ("final500", "eligible_pool", "rejected", "run_metadata", "tag_summary"):
+            for name in (final_sheet, "eligible_pool", "rejected", "run_metadata", "tag_summary"):
                 if name in wb.sheetnames:
                     ws = wb[name]
                     ws.freeze_panes = "A2"

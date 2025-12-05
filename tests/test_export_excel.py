@@ -42,6 +42,7 @@ class TestExportExcel(unittest.TestCase):
             raise AssertionError("openpyxl is required for this test") from e
 
         cfg = AppConfig(targets=TargetsConfig(final_n=1, pool_n=1, sampling_seed=123))
+        final_sheet = f"final{int(cfg.targets.final_n)}"
 
         with tempfile.TemporaryDirectory() as td:
             out_path = Path(td) / "corpus.xlsx"
@@ -105,13 +106,13 @@ class TestExportExcel(unittest.TestCase):
             self.assertTrue(out_path.exists())
 
             wb = load_workbook(out_path)
-            self.assertIn("final500", wb.sheetnames)
+            self.assertIn(final_sheet, wb.sheetnames)
             self.assertIn("eligible_pool", wb.sheetnames)
             self.assertIn("rejected", wb.sheetnames)
             self.assertIn("run_metadata", wb.sheetnames)
             self.assertIn("tag_summary", wb.sheetnames)
 
-            ws = wb["final500"]
+            ws = wb[final_sheet]
             rows = list(ws.iter_rows(values_only=True))
             self.assertGreaterEqual(len(rows), 2)  # header + at least one row
 
